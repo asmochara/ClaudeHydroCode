@@ -1,0 +1,45 @@
+# Radiation-matter coupling verification: a static, uniform, optically thick
+# DT slab (constant kappa = 10 cm^2/g) with matter at 100 eV and radiation
+# initialized at Tr = 200 eV. The radiation field must relax to equilibrium
+# with the matter (Er = a*Te^4) on the absorption time 1/(c*kappa*rho) ~ 3 ps,
+# conserving total (matter + radiation) energy. The matter barely warms
+# (~ +0.2 eV) because its heat capacity dwarfs the radiation energy.
+
+[control]
+geometry     = planar
+temperatures = 2
+t_end        = 1e-10
+dt_init      = 1e-15
+dt_max       = 1e-12
+cfl          = 0.4
+bc_outer     = wall
+T_floor      = 0.01
+
+[conduction]
+enabled = false
+
+[radiation]
+enabled  = true
+bc_outer = insulated
+
+[output]
+directory      = out_rad_equil
+dt_dump        = 5e-11
+history_stride = 10
+
+[material dt]
+eos        = ideal
+gamma      = 1.6666667
+A          = 2.5
+Z          = 1.0
+ionization = fixed
+kappa_R    = 10.0
+kappa_P    = 10.0
+
+[layer]
+material  = dt
+thickness = 0.1
+zones     = 20
+rho0      = 1.0
+T0        = 100.0
+Tr0       = 200.0

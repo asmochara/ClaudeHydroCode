@@ -13,7 +13,10 @@ option(HYDRO1D_USE_OPENMP "Enable OpenMP threading" ON)
 add_executable(hydro1d
   src/main.cpp
   src/input.cpp
+  src/table2d.cpp
   src/eos.cpp
+  src/zbar.cpp
+  src/opacity.cpp
   src/simulation.cpp
 )
 

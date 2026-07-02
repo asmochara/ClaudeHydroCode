@@ -1,30 +1,33 @@
 #pragma once
 
+#include "opacity.hpp"
+#include "table2d.hpp"
+#include "zbar.hpp"
+
 #include <memory>
 #include <string>
-#include <vector>
 
-// Equation-of-state interface. All quantities in CGS with temperature in eV:
+// All quantities CGS with temperature in eV:
 //   rho [g/cm^3], T [eV], P [dyn/cm^2], e [erg/g], cv [erg/g/eV], cs2 [cm^2/s^2]
+
+// ---------------------------------------------------------------------------
+// Single-temperature (total) EOS, used in 1T mode.
 class EOS {
 public:
     virtual ~EOS() = default;
     virtual double pressure(double rho, double T) const = 0;
     virtual double energy(double rho, double T) const = 0;
     virtual double cv(double rho, double T) const = 0;
-    // Invert e(rho,T) for T; Tguess accelerates the search.
     virtual double temperature(double rho, double e, double Tguess) const = 0;
-    // Invert P(rho,T) for T (used for pressure-specified initial conditions).
     virtual double temperatureFromPressure(double rho, double P) const = 0;
-    // Adiabatic sound speed squared.
     virtual double soundSpeed2(double rho, double T) const = 0;
 };
 
-// Fully ionized (or fixed-ionization) ideal gas:
-//   P = rho * (1+Zbar) * kB*T / (A*m_p),  e = P / ((gamma-1)*rho)
+// Ideal gas of ions + electrons with a (possibly rho,T-dependent) mean
+// ionization: P = rho (1+Zbar(rho,T)) kB T / (A m_p), e = P/((gamma-1) rho).
 class IdealGasEOS : public EOS {
 public:
-    IdealGasEOS(double gamma, double A, double Zbar);
+    IdealGasEOS(double gamma, double A, std::shared_ptr<const ZbarModel> zb);
     double pressure(double rho, double T) const override;
     double energy(double rho, double T) const override;
     double cv(double rho, double T) const override;
@@ -32,13 +35,11 @@ public:
     double temperatureFromPressure(double rho, double P) const override;
     double soundSpeed2(double rho, double T) const override;
 private:
-    double gamma_;
-    double Rspec_;  // (1+Zbar)*eV/(A*m_p)  [erg/g/eV]
+    double gamma_, R0_;  // R0 = eV/(A m_p) [erg/g/eV]
+    std::shared_ptr<const ZbarModel> zb_;
 };
 
-// Tabulated EOS on a rectangular (rho, T) grid, bilinear interpolation in
-// (ln rho, ln T). This is the hook for SESAME/LEOS-style tables; the ASCII
-// format is documented in the README. e(rho,T) must increase with T.
+// Tabulated total EOS: P and e blocks on a (rho,T) grid (README format).
 class TabulatedEOS : public EOS {
 public:
     explicit TabulatedEOS(const std::string& path);
@@ -49,16 +50,71 @@ public:
     double temperatureFromPressure(double rho, double P) const override;
     double soundSpeed2(double rho, double T) const override;
 private:
-    double interp(const std::vector<double>& tab, double rho, double T) const;
-    std::vector<double> lnRho_, lnT_;   // grid (ascending)
-    std::vector<double> P_, e_;         // row-major [irho*NT + iT]
-    double Tmin_, Tmax_;
+    Table2D tab_;
 };
 
-// A material ties an EOS to the atomic data needed by transport models.
+// ---------------------------------------------------------------------------
+// Per-species EOS (ion or electron partial pressure/energy), used in 2T mode.
+class SpeciesEOS {
+public:
+    virtual ~SpeciesEOS() = default;
+    virtual double pressure(double rho, double T) const = 0;
+    virtual double energy(double rho, double T) const = 0;
+    virtual double cv(double rho, double T) const;        // numeric default
+    virtual double temperature(double rho, double e, double Tguess) const;
+    // This species' contribution to the adiabatic sound speed squared,
+    // (dP/drho)_T + T (dP/dT)^2 / (rho^2 cv) by default.
+    virtual double cs2Contribution(double rho, double T) const;
+protected:
+    virtual double Tlo() const { return 1e-12; }
+    virtual double Thi() const { return 1e9; }
+};
+
+class IdealIonEOS : public SpeciesEOS {
+public:
+    IdealIonEOS(double gamma, double A);
+    double pressure(double rho, double T) const override;
+    double energy(double rho, double T) const override;
+    double cv(double rho, double T) const override;
+    double temperature(double rho, double e, double Tguess) const override;
+    double cs2Contribution(double rho, double T) const override;
+private:
+    double gamma_, R0_;
+};
+
+class IdealElectronEOS : public SpeciesEOS {
+public:
+    IdealElectronEOS(double gamma, double A, std::shared_ptr<const ZbarModel> zb);
+    double pressure(double rho, double T) const override;
+    double energy(double rho, double T) const override;
+    double cs2Contribution(double rho, double T) const override;
+private:
+    double gamma_, R0_;
+    std::shared_ptr<const ZbarModel> zb_;
+};
+
+// Tabulated species EOS (e.g. SESAME/LEOS electron or ion sub-tables),
+// same two-block file format as the total tabulated EOS.
+class TableSpeciesEOS : public SpeciesEOS {
+public:
+    explicit TableSpeciesEOS(const std::string& path);
+    double pressure(double rho, double T) const override;
+    double energy(double rho, double T) const override;
+protected:
+    double Tlo() const override { return tab_.Tmin(); }
+    double Thi() const override { return tab_.Tmax(); }
+private:
+    Table2D tab_;
+};
+
+// ---------------------------------------------------------------------------
+// A material ties EOS models to the atomic/transport data.
 struct Material {
     std::string name;
-    double A = 1.0;      // mean atomic mass [amu]
-    double Zbar = 1.0;   // mean ionization state
-    std::shared_ptr<EOS> eos;
+    double A = 1.0;                       // mean atomic mass [amu]
+    double Z = 1.0;                       // nuclear charge (or fixed Zbar)
+    std::shared_ptr<ZbarModel> zbar;
+    std::shared_ptr<EOS> eos;             // 1T mode
+    std::shared_ptr<SpeciesEOS> ion, ele; // 2T mode
+    std::shared_ptr<Opacity> opacity;     // radiation (may be null)
 };

@@ -23,12 +23,15 @@ for path in sys.argv[1:]:
     df = pd.read_csv(path, comment="#")
     uc = 0.5 * (df.u_left + df.u_right)
     axes[0, 0].plot(df.r_center, df.rho, label=label)
-    axes[0, 1].plot(df.r_center, df.T_eV, label=label)
+    axes[0, 1].plot(df.r_center, df.Ti_eV, label=f"Ti {label}")
+    axes[0, 1].plot(df.r_center, df.Te_eV, "--", label=f"Te {label}")
+    if df.Tr_eV.max() > 0:
+        axes[0, 1].plot(df.r_center, df.Tr_eV, ":", label=f"Tr {label}")
     axes[1, 0].plot(df.r_center, df.P, label=label)
     axes[1, 1].plot(df.r_center, uc, label=label)
 
 axes[0, 0].set_ylabel(r"$\rho$ [g/cm$^3$]")
-axes[0, 1].set_ylabel(r"$T$ [eV]")
+axes[0, 1].set_ylabel(r"$T_i,\ T_e,\ T_r$ [eV]")
 axes[1, 0].set_ylabel(r"$P$ [dyn/cm$^2$]")
 axes[1, 1].set_ylabel(r"$u$ [cm/s]")
 for ax in axes.flat:

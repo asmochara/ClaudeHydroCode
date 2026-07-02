@@ -1,0 +1,78 @@
+# ICF capsule implosion with the full physics stack: two temperatures,
+# flux-limited Spitzer-Harm electron conduction, grey flux-limited radiation
+# diffusion, and Thomas-Fermi ionization. Same capsule and drive as
+# icf_capsule.deck. Generate the demo opacity tables first:
+#   python3 tools/make_test_opacity.py examples/dt.opac --Z 1   --A 2.5
+#   python3 tools/make_test_opacity.py examples/ch.opac --Z 3.5 --A 6.51
+# (Kramers-like test data; use OPLIB/TOPS reductions for real work.)
+
+[control]
+geometry     = spherical
+temperatures = 2
+t_end        = 12e-9
+dt_init      = 1e-14
+cfl          = 0.35
+bc_outer     = pressure
+T_floor      = 0.01
+
+[conduction]
+enabled      = true
+flux_limiter = 0.06
+ln_lambda    = auto
+
+[radiation]
+enabled  = true
+bc_outer = vacuum
+
+[drive]
+table = 0.0 5e11   1.0e-9 5e12   3.0e-9 2e13   6.0e-9 1.0e14   12e-9 1.0e14
+
+[output]
+directory      = out_icf_2t
+dt_dump        = 0.5e-9
+history_stride = 50
+
+[material dt_gas]
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material dt_ice]
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material ch]
+eos           = ideal
+gamma         = 1.6666667
+A             = 6.51
+Z             = 3.5     # average-atom nuclear charge for CH
+ionization    = tf
+opacity_table = examples/ch.opac
+
+[layer]
+material  = dt_gas
+thickness = 0.085
+zones     = 120
+rho0      = 5e-4
+T0        = 0.025
+
+[layer]
+material  = dt_ice
+thickness = 0.007
+zones     = 100
+rho0      = 0.25
+T0        = 0.025
+
+[layer]
+material  = ch
+thickness = 0.012
+zones     = 80
+rho0      = 1.05
+T0        = 0.025

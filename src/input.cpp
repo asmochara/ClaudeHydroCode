@@ -98,7 +98,8 @@ InputDeck parseDeck(const std::string& path) {
             } else if (section == "layer") {
                 deck.layers.emplace_back();
             } else if (section != "control" && section != "conduction" &&
-                       section != "output" && section != "drive") {
+                       section != "radiation" && section != "output" &&
+                       section != "drive") {
                 fail("unknown section [" + section + "]");
             }
             continue;
@@ -123,6 +124,7 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "c_quad")    c.c_quad = toDouble(val, key);
             else if (key == "c_lin")     c.c_lin = toDouble(val, key);
             else if (key == "T_floor")   c.T_floor = toDouble(val, key);
+            else if (key == "temperatures") c.temperatures = toInt(val, key);
             else if (key == "geometry") {
                 if      (val == "planar")      c.geometry = 1;
                 else if (val == "cylindrical") c.geometry = 2;
@@ -135,7 +137,14 @@ InputDeck parseDeck(const std::string& path) {
             if      (key == "enabled")      c.enabled = toBool(val, key);
             else if (key == "flux_limiter") c.flux_limiter = toDouble(val, key);
             else if (key == "ln_lambda")    c.ln_lambda = (val == "auto") ? -1.0 : toDouble(val, key);
+            else if (key == "ion_conduction")   c.ion_conduction = toBool(val, key);
+            else if (key == "ion_flux_limiter") c.ion_flux_limiter = toDouble(val, key);
             else fail("unknown conduction key '" + key + "'");
+        } else if (section == "radiation") {
+            auto& rd = deck.radiation;
+            if      (key == "enabled")  rd.enabled = toBool(val, key);
+            else if (key == "bc_outer") rd.bc_outer = val;
+            else fail("unknown radiation key '" + key + "'");
         } else if (section == "output") {
             auto& o = deck.output;
             if      (key == "directory")      o.directory = val;
@@ -160,6 +169,13 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "A")     m.A = toDouble(val, key);
             else if (key == "Z")     m.Z = toDouble(val, key);
             else if (key == "table") m.table_file = val;
+            else if (key == "table_ion")      m.table_ion = val;
+            else if (key == "table_electron") m.table_electron = val;
+            else if (key == "ionization")     m.ionization = val;
+            else if (key == "zbar_table")     m.zbar_table = val;
+            else if (key == "opacity_table")  m.opacity_table = val;
+            else if (key == "kappa_R")        m.kappa_R = toDouble(val, key);
+            else if (key == "kappa_P")        m.kappa_P = toDouble(val, key);
             else fail("unknown material key '" + key + "'");
         } else if (section == "layer") {
             auto& l = deck.layers.back();
@@ -169,6 +185,9 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "rho0")      l.rho0 = toDouble(val, key);
             else if (key == "T0")        l.T0 = toDouble(val, key);
             else if (key == "P0")        l.P0 = toDouble(val, key);
+            else if (key == "Ti0")       l.Ti0 = toDouble(val, key);
+            else if (key == "Te0")       l.Te0 = toDouble(val, key);
+            else if (key == "Tr0")       l.Tr0 = toDouble(val, key);
             else if (key == "ratio")     l.ratio = toDouble(val, key);
             else fail("unknown layer key '" + key + "'");
         } else {
@@ -188,22 +207,40 @@ InputDeck parseDeck(const std::string& path) {
         if (l.thickness <= 0.0) throw std::runtime_error("input: " + tag + " thickness must be > 0");
         if (l.zones <= 0) throw std::runtime_error("input: " + tag + " zones must be > 0");
         if (l.rho0 <= 0.0) throw std::runtime_error("input: " + tag + " rho0 must be > 0");
-        if (l.T0 <= 0.0 && l.P0 <= 0.0)
-            throw std::runtime_error("input: " + tag + " needs T0 [eV] or P0 [dyn/cm^2]");
+        if (l.T0 <= 0.0 && l.P0 <= 0.0 && !(l.Ti0 > 0.0 && l.Te0 > 0.0))
+            throw std::runtime_error("input: " + tag +
+                                     " needs T0 [eV], P0 [dyn/cm^2], or Ti0 and Te0");
         if (l.ratio <= 0.0) throw std::runtime_error("input: " + tag + " ratio must be > 0");
     }
+    const bool twoT = (deck.control.temperatures == 2);
+    if (deck.control.temperatures != 1 && deck.control.temperatures != 2)
+        throw std::runtime_error("input: control.temperatures must be 1 or 2");
     for (const auto& [name, m] : deck.materials) {
+        const std::string tag = "input: material " + name + ": ";
         if (m.eos != "ideal" && m.eos != "table")
-            throw std::runtime_error("input: material " + name + ": eos must be ideal|table");
-        if (m.eos == "table" && m.table_file.empty())
-            throw std::runtime_error("input: material " + name + ": table eos needs 'table = FILE'");
+            throw std::runtime_error(tag + "eos must be ideal|table");
+        if (m.eos == "table" && !twoT && m.table_file.empty())
+            throw std::runtime_error(tag + "table eos needs 'table = FILE'");
+        if (m.eos == "table" && twoT && (m.table_ion.empty() || m.table_electron.empty()))
+            throw std::runtime_error(tag + "table eos in 2T mode needs 'table_ion' "
+                                     "and 'table_electron' files");
         if (m.A <= 0.0 || m.Z <= 0.0)
-            throw std::runtime_error("input: material " + name + ": A and Z must be > 0");
+            throw std::runtime_error(tag + "A and Z must be > 0");
+        if (m.ionization != "fixed" && m.ionization != "tf" && m.ionization != "table")
+            throw std::runtime_error(tag + "ionization must be fixed|tf|table");
+        if (m.ionization == "table" && m.zbar_table.empty())
+            throw std::runtime_error(tag + "ionization = table needs 'zbar_table = FILE'");
+        if (deck.radiation.enabled && m.opacity_table.empty() &&
+            (m.kappa_R <= 0.0 || m.kappa_P <= 0.0))
+            throw std::runtime_error(tag + "radiation is enabled; give 'opacity_table' "
+                                     "or constant 'kappa_R' and 'kappa_P' [cm^2/g]");
     }
     if (deck.control.bc_outer != "wall" && deck.control.bc_outer != "pressure")
         throw std::runtime_error("input: control.bc_outer must be wall|pressure");
     if (deck.control.bc_outer == "pressure" && deck.drive.empty())
         throw std::runtime_error("input: bc_outer = pressure requires a [drive] table");
+    if (deck.radiation.bc_outer != "insulated" && deck.radiation.bc_outer != "vacuum")
+        throw std::runtime_error("input: radiation.bc_outer must be insulated|vacuum");
 
     return deck;
 }

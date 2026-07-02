@@ -1,0 +1,38 @@
+# Two-temperature verification: electron-ion temperature relaxation in a
+# static, uniform DT plasma (rho = 1 g/cc, Ti0 = 300 eV, Te0 = 100 eV).
+# With fixed Z = 1 the ion and electron heat capacities are equal, so the
+# temperatures must relax exponentially to (300+100)/2 = 200 eV at the NRL
+# equilibration rate (~1e12 1/s here), with total energy conserved.
+
+[control]
+geometry     = planar
+temperatures = 2
+t_end        = 1e-11
+dt_init      = 1e-16
+dt_max       = 1e-15
+cfl          = 0.4
+bc_outer     = wall
+T_floor      = 0.01
+
+[conduction]
+enabled = false
+
+[output]
+directory      = out_relax_ei
+dt_dump        = 5e-12
+history_stride = 10
+
+[material dt]
+eos        = ideal
+gamma      = 1.6666667
+A          = 2.5
+Z          = 1.0
+ionization = fixed
+
+[layer]
+material  = dt
+thickness = 0.1
+zones     = 20
+rho0      = 1.0
+Ti0       = 300.0
+Te0       = 100.0

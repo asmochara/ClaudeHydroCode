@@ -3,7 +3,7 @@
 A compact C++17 Lagrangian hydrodynamics code for shocks and compressible
 flow in 1D planar, cylindrical, or spherical geometry, aimed at simulating
 inertial-confinement-fusion capsule implosions driven by an applied
-(ablation-like) pressure source. No radiation transport yet.
+(ablation-like) pressure source.
 
 ## Physics and numerics
 
@@ -14,29 +14,61 @@ inertial-confinement-fusion capsule implosions driven by an applied
   the scheme is second-order-accurate on smooth flow for any EOS.
 - **Shock capturing:** combined quadratic (von Neumann–Richtmyer) + linear
   (Landshoff) artificial viscosity, active only in compression
-  (`c_quad`, `c_lin` in the deck).
+  (`c_quad`, `c_lin` in the deck). In 2T mode the viscous (shock) heating
+  goes to the ions, as it should.
 - **Geometry:** planar / cylindrical / spherical via the `geometry` key;
   the planar option exists mainly so shock-tube validation problems can be
   run with the same executable.
+- **Temperatures:** single-temperature (`temperatures = 1`) or separate
+  ion/electron temperatures (`temperatures = 2`). In 2T mode each species
+  carries its own energy equation, and the temperatures relax at the
+  NRL-formulary electron–ion equilibration rate, integrated
+  pointwise-implicitly (unconditionally stable).
 - **Equation of state:** per-material, either
-  - `ideal`: fully/partially ionized ideal gas
-    `P = rho (1+Zbar) kB T / (A m_p)`, `e = P / ((gamma-1) rho)`, or
+  - `ideal`: ideal ion + electron gases with mean ionization Zbar from the
+    ionization model (below); in 1T mode
+    `P = rho (1+Zbar) kB T / (A m_p)`, in 2T mode the ion and electron
+    partial EOS are separate; or
   - `table`: bilinear lookup of `P(rho,T)` and `e(rho,T)` on a rectangular
-    `(rho, T)` grid (interpolated in log rho, log T), with Newton/bisection
-    inversion for `T(rho,e)` and a thermodynamically consistent sound speed
-    `cs^2 = (dP/drho)_T + T (dP/dT)_rho^2 / (rho^2 cv)`.
-    This is the hook for SESAME/LEOS-derived tables (format below).
-- **Thermal conduction:** single-temperature flux-limited Spitzer–Härm
-  electron conduction,
-  `kappa = gamma0(Z) ne kB Te tau_e / me` with the NRL-formulary collision
-  time and Coulomb logarithm and `gamma0(Z) = 13.58 (Z+0.24)/(Z+4.24)`
-  (a fit through the Braginskii coefficients, 3.2 at Z=1). The heat flux is
-  limited against the free-streaming flux with the standard sharp limiter
+    grid (interpolated in log rho, log T) with robust `T(rho,e)` inversion
+    and a thermodynamically consistent sound speed. In 2T mode give
+    separate `table_ion` and `table_electron` files (e.g. SESAME/LEOS
+    sub-tables). This is the hook for real tabular EOS data.
+- **Ionization:** per-material `ionization = fixed | tf | table`.
+  `fixed` uses Zbar = Z; `tf` is the Thomas–Fermi average-atom fit of
+  R. M. More (1985) — the standard hydrocode TF fit — using the material's
+  nuclear charge Z and atomic weight A (average-atom values for mixtures);
+  `table` reads Zbar(rho,T) from a single-block table file, e.g. reduced
+  from TOPS/OPLIB ionization output. Zbar feeds the ideal EOS, conduction,
+  coupling, and Coulomb logarithms. (`hydro1d --tf Z A rho T` prints the
+  TF Zbar for quick checks.)
+- **Thermal conduction:** flux-limited Spitzer–Härm electron conduction,
+  `kappa_e = gamma0(Zbar) ne kB Te tau_e / me` with the NRL-formulary
+  collision time and Coulomb logarithm and
+  `gamma0(Z) = 13.58 (Z+0.24)/(Z+4.24)` (a fit through the Braginskii
+  coefficients, 3.2 at Z=1). The heat flux is limited against the
+  free-streaming flux with the standard sharp limiter
   `q = q_SH / (1 + |q_SH| / (f ne kB Te v_te))`, `f = flux_limiter`
-  (default 0.06). Conduction is operator-split from the hydro and
-  integrated implicitly (backward Euler, tridiagonal Thomas solve), with
-  conductivities harmonically averaged at zone faces so material
-  interfaces behave correctly. Boundaries are insulated.
+  (default 0.06). In 2T mode, Braginskii **ion conduction**
+  (`kappa_i = 3.9 ni kB Ti tau_i / mi`, `ion_flux_limiter` default 0.3) is
+  also applied to the ion temperature — important for smoothing the
+  converging-shock ion-temperature spike at void closure. Both are
+  operator-split, integrated implicitly (backward Euler, tridiagonal
+  Thomas solve), with face conductivities harmonically averaged so
+  material interfaces behave correctly. Boundaries are insulated.
+- **Radiation:** grey flux-limited radiation diffusion
+  (Levermore–Pomraning limiter) for the radiation energy density, with
+  linearized-Planck emission/absorption coupling to the electron (or 1T
+  matter) temperature, solved backward-Euler with a tridiagonal solve; the
+  discrete matter–radiation exchange is exactly energy-conserving.
+  Radiation pressure (Er/3) enters the momentum equation and Er is
+  compressed adiabatically (gamma = 4/3) during the hydro update.
+  Opacities per material: constant `kappa_R`/`kappa_P` [cm^2/g] or an
+  `opacity_table` of Rosseland and Planck means on the standard grid —
+  the intended source is the Los Alamos OPLIB tables via TOPS
+  (https://aphysics2.lanl.gov/apps/), reduced to grey means.
+  `radiation.bc_outer` is `insulated` or `vacuum` (Marshak leakage,
+  tracked in the energy budget).
 - **Pressure drive:** a piecewise-linear-in-time applied pressure at the
   outer boundary (`[drive]` table + `bc_outer = pressure`) stands in for
   the ablation pressure that starts the confinement. The cumulative drive
@@ -44,6 +76,10 @@ inertial-confinement-fusion capsule implosions driven by an applied
   history file.
 - **Units:** CGS everywhere, temperatures in eV
   (1 Mbar = 1e12 dyn/cm^2).
+
+Not included (yet): DT burn/alpha heating, multigroup radiation, ablation
+physics/laser deposition, electron degeneracy in the ideal EOS (use tables
+for degenerate/cold-matter regimes).
 
 ## Building
 
@@ -57,27 +93,43 @@ cmake --build build
 ## Running
 
 ```sh
-./build/hydro1d examples/icf_capsule.deck
+./build/hydro1d examples/icf_capsule_2t.deck
 ```
 
-Two example decks are provided:
+Example decks (all runtimes seconds on one core):
 
 - `examples/sod.deck` — planar Sod shock tube. At t = 0.2 the computed
   contact plateau (0.42633 vs 0.42632 exact), post-shock density
   (0.26552 vs 0.26557), and shock position (0.850 vs 0.8504) match the
   analytic solution to <0.1%; global energy error ~3e-5.
-- `examples/icf_capsule.deck` — a simplified spherical DT-gas / DT-ice /
-  CH capsule driven by a 100 Mbar pressure ramp, conduction on. It
-  produces an implosion with convergence ratio ~35, a multi-keV hot spot,
-  peak fuel density of several hundred g/cc, and peak ρR ≈ 1.7 g/cm².
-- `examples/sod_table.deck` — the same Sod problem run through the
-  tabulated-EOS path (generate the table first, see below); it reproduces
-  the ideal-gas run to interpolation error (~0.06% L1 in density).
+- `examples/sod_table.deck` — the same problem through the tabulated-EOS
+  path (generate `examples/ideal_g1.4.eos` first with
+  `tools/make_ideal_table.py`); matches the ideal run to interpolation
+  error (~0.06% L1 in density).
+- `examples/relax_ei.deck` — 2T verification: a static uniform DT plasma
+  with Ti = 300 eV, Te = 100 eV relaxes to 200 eV at the NRL rate with
+  machine-precision energy conservation.
+- `examples/rad_equil.deck` — radiation verification: an optically thick
+  slab with Tr = 200 eV, Te = 100 eV relaxes to exact equilibrium
+  (Er = a Te^4, Te → 100.18 eV as predicted by the energy budget) with
+  machine-precision conservation.
+- `examples/icf_capsule.deck` — 1T spherical DT-gas / DT-ice / CH capsule
+  driven by a 100 Mbar pressure ramp, conduction on: convergence ratio
+  ~35, multi-keV hot spot, peak fuel density ~420 g/cc, peak
+  rhoR ≈ 1.7 g/cm².
+- `examples/icf_capsule_2t.deck` — the same capsule with the full stack:
+  2T, ion + electron conduction, Thomas–Fermi ionization, and radiation
+  diffusion with Kramers-like demo opacity tables (generate
+  `examples/dt.opac` / `examples/ch.opac` first with
+  `tools/make_test_opacity.py`, see the deck header). Shows the expected
+  2T signatures: shocked ions run hotter than electrons in flight, a
+  brief multi-keV ion flash at void closure smoothed by ion conduction,
+  and a hot spot cooled by radiating into the optically thick fuel.
 
-A quick-look plotting script (requires matplotlib + pandas) is included:
+Quick-look plotting (requires matplotlib + pandas):
 
 ```sh
-python3 tools/plot_snapshot.py out_icf/snap_00000.csv out_icf/snap_00021.csv
+python3 tools/plot_snapshot.py out_icf_2t/snap_00000.csv out_icf_2t/snap_00021.csv
 ```
 
 ## Input deck format
@@ -87,55 +139,71 @@ See the examples for complete decks.
 
 | Section | Keys |
 |---|---|
-| `[control]` | `t_end`, `dt_init`, `dt_max`, `cfl`, `dt_growth`, `max_steps`, `geometry` (planar/cylindrical/spherical), `r_min`, `bc_outer` (wall/pressure), `c_quad`, `c_lin`, `T_floor` [eV] |
-| `[conduction]` | `enabled`, `flux_limiter`, `ln_lambda` (number or `auto` for NRL formulary) |
+| `[control]` | `t_end`, `dt_init`, `dt_max`, `cfl`, `dt_growth`, `max_steps`, `geometry` (planar/cylindrical/spherical), `temperatures` (1/2), `r_min`, `bc_outer` (wall/pressure), `c_quad`, `c_lin`, `T_floor` [eV] |
+| `[conduction]` | `enabled`, `flux_limiter`, `ln_lambda` (number or `auto`), `ion_conduction` (2T, default true), `ion_flux_limiter` |
+| `[radiation]` | `enabled`, `bc_outer` (insulated/vacuum) |
 | `[drive]` | `table = t0 p0 t1 p1 ...` (s, dyn/cm^2), linearly interpolated, end values held |
 | `[output]` | `directory`, `dt_dump` (s), `history_stride` |
-| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (mean ionization), `table` (file, for `eos = table`) |
-| `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), `ratio` (outer/inner zone-width ratio for geometric zoning) |
+| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
+| `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), optional `Ti0`/`Te0` (2T), `Tr0` (radiation), `ratio` (outer/inner zone-width ratio) |
 
-## Tabulated EOS format
+## Table file format
 
-ASCII, `#` comments allowed anywhere:
+All tables (EOS, opacity, ionization) share one ASCII layout with `#`
+comments allowed anywhere:
 
 ```
 NR NT
-rho grid, ascending           (NR values, g/cc)
-T grid, ascending             (NT values, eV)
-P(rho_i, T_j) row-major in rho  (NR*NT values, dyn/cm^2)
-e(rho_i, T_j) row-major in rho  (NR*NT values, erg/g)
+rho grid, ascending                 (NR values, g/cc)
+T grid, ascending                   (NT values, eV)
+block 1 (rho_i, T_j) row-major in rho   (NR*NT values)
+block 2 ...
 ```
 
-`e` must be monotonically increasing in T at fixed rho.
-`tools/make_ideal_table.py` writes an ideal-gas table in this format, both
-as a self-test of the lookup path and as a template for converting real
-SESAME/LEOS data.
+- **EOS** (total, ion, or electron): two blocks — P [dyn/cm^2] then
+  e [erg/g]; e must increase with T at fixed rho.
+- **Opacity**: two blocks — Rosseland then Planck mean [cm^2/g]
+  (interpolated log-log-log).
+- **Ionization**: one block — Zbar.
+
+`tools/make_ideal_table.py` writes an ideal-gas EOS table (self-test of
+the lookup path and a template for SESAME/LEOS conversions);
+`tools/make_test_opacity.py` writes a Kramers-like demo opacity table and
+documents the intended OPLIB/TOPS workflow.
 
 ## Output
 
-- `snap_NNNNN.csv` — zone-by-zone state (radii, velocities, rho, T, P, e,
-  cs, artificial viscosity, material) at each dump time.
+- `snap_NNNNN.csv` — zone-by-zone state at each dump time: radii,
+  velocities, rho, Ti, Te, Tr (radiation temperature), Zbar, matter
+  pressure, specific internal energy, sound speed, artificial viscosity,
+  material.
 - `history.csv` — per-step time series: outer radius/velocity, drive
-  pressure, max density, max/central temperature, ρR, internal and kinetic
-  energy, cumulative drive work, and the relative energy-conservation
-  error `E_err = (E_int + E_kin - E_0 - W_drive)/E`.
+  pressure, max density, max ion/electron temperature, central electron
+  temperature, rhoR, internal/kinetic/radiation energy, cumulative drive
+  work, radiation leaked through the boundary, and the relative
+  energy-conservation error
+  `E_err = (E_int + E_kin + E_rad - E_0 - W_drive + E_leak)/E`.
 
 ## Parallelism and design notes
 
-The zone loops (EOS evaluation, viscosity, energy update, conduction
-coefficients) are threaded with OpenMP; the code is memory-light and, as
-intended, entirely comfortable on a single core (the ICF example runs in
-under a second). The physics is deliberately factored — `EOS` is an
-abstract interface, conduction is a self-contained operator-split stage —
-so the natural upgrades slot in without restructuring:
+The zone loops (EOS evaluation, viscosity, energy update, transport
+coefficients) are threaded with OpenMP; the tridiagonal solves are serial
+but trivially cheap in 1D. The code is memory-light and, as intended,
+entirely comfortable on a single core (the full-physics capsule runs in
+tens of seconds).
 
-- **LLNL libraries:** the current core is dependency-free on purpose (300
-  zones on one core doesn't benefit from them), but the loop structure maps
+The physics is deliberately factored — `EOS`/`SpeciesEOS`, `ZbarModel`,
+and `Opacity` are abstract interfaces sharing one `Table2D` reader, and
+each transport process is a self-contained operator-split stage — so the
+natural upgrades slot in without restructuring:
+
+- **LLNL libraries:** the core is dependency-free on purpose (a few
+  hundred zones on one core don't benefit), but the loop structure maps
   directly onto [RAJA](https://github.com/LLNL/RAJA) kernels if GPU/many-core
-  portability is ever wanted, and stiffer physics (radiation diffusion,
-  multi-group) would be a good fit for
+  portability is ever wanted, and stiffer coupled physics (multigroup
+  radiation) would be a good fit for
   [SUNDIALS](https://github.com/LLNL/sundials) implicit integrators instead
-  of the built-in tridiagonal solve. The `TabulatedEOS` reader is the
-  attachment point for LEOS/SESAME table data.
-- **Obvious next physics steps:** separate ion/electron temperatures,
-  radiation diffusion, ionization models (Thomas–Fermi Zbar), and DT burn.
+  of the built-in tridiagonal solves. The table readers are the
+  attachment points for LEOS/SESAME EOS data and OPLIB/TOPS opacities.
+- **Obvious next physics steps:** DT burn with alpha heating, multigroup
+  radiation diffusion, and laser/ablation source models.
