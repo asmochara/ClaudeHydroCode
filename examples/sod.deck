@@ -1,0 +1,47 @@
+# Sod shock tube (planar) -- hydro validation problem.
+# Units are CGS; the problem is scale-free so the classic non-dimensional
+# values are used directly. Analytic solution at t = 0.2:
+#   post-shock density 0.26557, contact plateau 0.42632,
+#   shock at x = 0.8504, contact at x = 0.6854.
+
+[control]
+geometry  = planar
+t_end     = 0.2
+dt_init   = 1e-9
+cfl       = 0.4
+bc_outer  = wall
+T_floor   = 1e-20     # temperatures are ~1e-13 eV in these scale-free units
+
+[conduction]
+enabled = false
+
+[output]
+directory      = out_sod
+dt_dump        = 0.05
+history_stride = 100
+
+[material left]
+eos   = ideal
+gamma = 1.4
+A     = 1.0
+Z     = 1.0
+
+[material right]
+eos   = ideal
+gamma = 1.4
+A     = 1.0
+Z     = 1.0
+
+[layer]
+material  = left
+thickness = 0.5
+zones     = 400
+rho0      = 1.0
+P0        = 1.0
+
+[layer]
+material  = right
+thickness = 0.5
+zones     = 400
+rho0      = 0.125
+P0        = 0.1

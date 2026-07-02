@@ -1,0 +1,46 @@
+# Sod shock tube using the tabulated-EOS path for both materials.
+# Generate the table first:
+#   python3 tools/make_ideal_table.py examples/ideal_g1.4.eos --gamma 1.4
+# Results should match examples/sod.deck to within table-interpolation error.
+
+[control]
+geometry  = planar
+t_end     = 0.2
+dt_init   = 1e-9
+cfl       = 0.4
+bc_outer  = wall
+T_floor   = 1e-20
+
+[conduction]
+enabled = false
+
+[output]
+directory      = out_sod_table
+dt_dump        = 0.05
+history_stride = 100
+
+[material left]
+eos   = table
+table = examples/ideal_g1.4.eos
+A     = 1.0
+Z     = 1.0
+
+[material right]
+eos   = table
+table = examples/ideal_g1.4.eos
+A     = 1.0
+Z     = 1.0
+
+[layer]
+material  = left
+thickness = 0.5
+zones     = 400
+rho0      = 1.0
+P0        = 1.0
+
+[layer]
+material  = right
+thickness = 0.5
+zones     = 400
+rho0      = 0.125
+P0        = 0.1

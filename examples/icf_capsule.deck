@@ -1,0 +1,66 @@
+# Simplified ICF capsule implosion: DT gas fill / DT ice / CH ablator,
+# driven by an applied pressure ramp at the outer surface (a stand-in for
+# ablation pressure -- no radiation or laser deposition in this model).
+# Flux-limited Spitzer-Harm conduction is on. Units: CGS + eV.
+
+[control]
+geometry  = spherical
+t_end     = 12e-9
+dt_init   = 1e-14
+cfl       = 0.35
+bc_outer  = pressure
+T_floor   = 0.01
+
+[conduction]
+enabled      = true
+flux_limiter = 0.06
+ln_lambda    = auto
+
+[drive]
+# time [s], applied pressure [dyn/cm^2] (1 Mbar = 1e12 dyn/cm^2).
+# ~0.5 Mbar foot rising to a 100 Mbar peak.
+table = 0.0 5e11   1.0e-9 5e12   3.0e-9 2e13   6.0e-9 1.0e14   12e-9 1.0e14
+
+[output]
+directory      = out_icf
+dt_dump        = 0.5e-9
+history_stride = 50
+
+[material dt_gas]
+eos   = ideal
+gamma = 1.6666667
+A     = 2.5      # equimolar D-T
+Z     = 1.0
+
+[material dt_ice]
+eos   = ideal
+gamma = 1.6666667
+A     = 2.5
+Z     = 1.0
+
+[material ch]
+eos   = ideal
+gamma = 1.6666667
+A     = 6.51     # CH, fully ionized average
+Z     = 3.5
+
+[layer]
+material  = dt_gas
+thickness = 0.085     # cm
+zones     = 120
+rho0      = 5e-4      # g/cm^3 (0.5 mg/cc vapor fill)
+T0        = 0.025     # eV (room temperature)
+
+[layer]
+material  = dt_ice
+thickness = 0.007
+zones     = 100
+rho0      = 0.25
+T0        = 0.025
+
+[layer]
+material  = ch
+thickness = 0.012
+zones     = 80
+rho0      = 1.05
+T0        = 0.025

@@ -1,0 +1,4 @@
+build/
+out_*/
+*.png
+examples/*.eos
