@@ -21,7 +21,12 @@ add_executable(hydro1d
   src/simulation.cpp
 )
 
-target_compile_options(hydro1d PRIVATE -Wall -Wextra)
+# Warning flags per compiler family (MSVC does not understand -Wall/-Wextra).
+if(MSVC)
+  target_compile_options(hydro1d PRIVATE /W3)
+else()
+  target_compile_options(hydro1d PRIVATE -Wall -Wextra)
+endif()
 
 if(HYDRO1D_USE_OPENMP)
   find_package(OpenMP)

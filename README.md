@@ -1,9 +1,23 @@
 # hydro1d — 1D Lagrangian hydrodynamics for ICF-style implosions
 
-A compact C++17 Lagrangian hydrodynamics code for shocks and compressible
-flow in 1D planar, cylindrical, or spherical geometry, aimed at simulating
-inertial-confinement-fusion capsule implosions driven by an applied
-(ablation-like) pressure source.
+A compact, dependency-free C++17 Lagrangian hydrodynamics code for shocks
+and compressible flow in 1D planar, cylindrical, or spherical geometry,
+built to simulate inertial-confinement-fusion capsule implosions. Capsules
+can be driven by ray-traced laser illumination (refraction,
+inverse-bremsstrahlung absorption, Langdon effect — the ablation pressure
+emerges self-consistently) or by a prescribed pressure source. The physics
+stack includes two-temperature ions/electrons with Fermi-degenerate
+electrons, flux-limited Spitzer–Härm and Braginskii conduction, grey
+flux-limited radiation diffusion, Thomas–Fermi (or tabulated) ionization,
+tabulated-EOS and tabulated-opacity hooks for SESAME/LEOS and OPLIB/TOPS
+data, and burn-off fusion diagnostics. Every run ends with a "shot report"
+of the standard ICF design metrics (implosion velocity, adiabat, IFAR,
+convergence ratio, rhoR, hot-spot conditions, neutron yield).
+
+The included examples range from analytic verification problems (Sod shock
+tube, two-temperature relaxation, radiation–matter equilibration, ray-optics
+turning radii) to a published 1.5-MJ triple-picket NIF direct-drive design;
+each runs in seconds to tens of seconds on a single core.
 
 ## Physics and numerics
 
@@ -134,22 +148,134 @@ is diagnostic-only), multigroup radiation, laser-plasma instabilities
 beyond the Langdon effect (no CBET, SRS/SBS), cold-curve bonding in the
 ideal EOS (use tables for cold-matter fidelity).
 
-## Building
+## Installation and setup
 
-Requires CMake ≥ 3.14 and a C++17 compiler. OpenMP is used if found.
+### Requirements
+
+- A C++17 compiler (g++ ≥ 8, clang ≥ 7, or MSVC from Visual Studio 2019+)
+- CMake ≥ 3.14
+- Python 3 (any recent version; used only by the table-generator and
+  plotting scripts — the generators have no third-party dependencies)
+- Optional: OpenMP (used automatically if found; the code is fast on a
+  single core without it)
+- Optional: the Python packages `matplotlib` and `pandas`, only for the
+  quick-look plotting script
+
+### Linux
+
+On a clean Ubuntu/Debian machine:
 
 ```sh
+sudo apt update
+sudo apt install -y build-essential cmake git python3
+```
+
+or on Fedora/RHEL:
+
+```sh
+sudo dnf install -y gcc-c++ cmake git python3
+```
+
+Then clone, build, and set up:
+
+```sh
+git clone <repository-url> ClaudeHydroCode
+cd ClaudeHydroCode
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build -j
+
+# Generate the demo data tables the examples reference (they are created
+# locally, not stored in git):
+python3 tools/make_ideal_table.py  examples/ideal_g1.4.eos --gamma 1.4
+python3 tools/make_test_opacity.py examples/dt.opac --Z 1   --A 2.5
+python3 tools/make_test_opacity.py examples/ch.opac --Z 3.5 --A 6.51
 ```
 
-## Running
+The executable is `build/hydro1d`. Optionally, for plotting:
 
 ```sh
-./build/hydro1d examples/icf_capsule_2t.deck
+python3 -m pip install matplotlib pandas
 ```
 
-Example decks (all runtimes seconds on one core):
+### Windows
+
+Three routes, in order of recommendation:
+
+**Option A — WSL (easiest).** Install the Windows Subsystem for Linux from
+an administrator PowerShell, then follow the Linux instructions above
+inside the Ubuntu shell:
+
+```powershell
+wsl --install -d Ubuntu    # reboot when prompted, then open "Ubuntu"
+```
+
+**Option B — native Visual Studio.**
+1. Install [Visual Studio 2022 Community](https://visualstudio.microsoft.com/)
+   with the **"Desktop development with C++"** workload (this includes the
+   MSVC compiler and CMake).
+2. Install [Python 3](https://www.python.org/downloads/) (check "Add
+   python.exe to PATH" in the installer).
+3. Open the **"x64 Native Tools Command Prompt for VS 2022"** from the
+   Start menu, then:
+
+```bat
+git clone <repository-url> ClaudeHydroCode
+cd ClaudeHydroCode
+cmake -B build
+cmake --build build --config Release
+
+python tools\make_ideal_table.py  examples\ideal_g1.4.eos --gamma 1.4
+python tools\make_test_opacity.py examples\dt.opac --Z 1   --A 2.5
+python tools\make_test_opacity.py examples\ch.opac --Z 3.5 --A 6.51
+```
+
+The executable is `build\Release\hydro1d.exe`. (MSVC's OpenMP support is
+older than GCC's but covers everything this code uses.)
+
+**Option C — MSYS2/MinGW.** From an MSYS2 UCRT64 shell:
+`pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake git python`,
+then follow the Linux instructions.
+
+### First run and verifying the build
+
+Run everything from the repository root — the example decks reference
+their table files by relative path (`examples/dt.opac`, ...). On Windows
+replace `./build/hydro1d` with `build\Release\hydro1d.exe`.
+
+```sh
+# 1. Hydro verification: Sod shock tube (< 1 s).
+./build/hydro1d examples/sod.deck
+#    -> out_sod/snap_00005.csv: density contact plateau 0.42633 vs the
+#       analytic 0.42632; shock front at x = 0.850 vs 0.8504.
+
+# 2. Physics verification: both should report E_err ~ 1e-15 in the last
+#    column of history.csv, and relax_ei's Ti/Te must meet at 200 eV.
+./build/hydro1d examples/relax_ei.deck
+./build/hydro1d examples/rad_equil.deck
+
+# 3. Ray-optics verification: turning radii must equal b/0.6 exactly.
+./build/hydro1d --raytrace examples/raytrace_test.deck
+
+# 4. A full laser-driven implosion with every model on (~20 s):
+./build/hydro1d examples/nif_triple_picket.deck
+#    -> the shot report prints at the end and is saved to out_nif/report.txt
+```
+
+Each run writes its output directory (named in the deck's `[output]`
+section) containing `report.txt`, `history.csv`, and `snap_NNNNN.csv`
+zone dumps. Quick-look plots of any snapshots:
+
+```sh
+python3 tools/plot_snapshot.py out_nif/snap_00000.csv out_nif/snap_00022.csv
+```
+
+Utility modes: `hydro1d --tf Z A rho T` prints the Thomas–Fermi mean
+ionization at the given conditions; `hydro1d --raytrace DECK` prints
+per-ray laser diagnostics for a deck's initial state.
+
+## Example decks
+
+All runtimes are seconds to tens of seconds on one core:
 
 - `examples/sod.deck` — planar Sod shock tube. At t = 0.2 the computed
   contact plateau (0.42633 vs 0.42632 exact), post-shock density
@@ -204,12 +330,6 @@ Example decks (all runtimes seconds on one core):
   from the crude demo opacities give a modest but complete implosion
   (~130 km/s shell, convergence ratio ~29, ~50 g/cc fuel at adiabat ~1.5);
   pulse-shape and opacity fidelity are left to the user.
-
-Quick-look plotting (requires matplotlib + pandas):
-
-```sh
-python3 tools/plot_snapshot.py out_icf_2t/snap_00000.csv out_icf_2t/snap_00021.csv
-```
 
 ## Input deck format
 
@@ -299,6 +419,8 @@ natural upgrades slot in without restructuring:
   [SUNDIALS](https://github.com/LLNL/sundials) implicit integrators instead
   of the built-in tridiagonal solves. The table readers are the
   attachment points for LEOS/SESAME EOS data and OPLIB/TOPS opacities.
-- **Obvious next physics steps:** DT burn with alpha heating, multigroup
-  radiation diffusion, and refined laser coupling (Langdon effect,
-  resonance-absorption models, cross-beam energy transfer proxies).
+- **Obvious next physics steps:** alpha-particle self-heating and fuel
+  depletion (turning the burn-off diagnostics into real burn), multigroup
+  radiation diffusion, nonlocal (SNB) electron transport, and refined
+  laser coupling (resonance-absorption models, cross-beam energy transfer
+  proxies).
