@@ -103,8 +103,24 @@ inertial-confinement-fusion capsule implosions driven by an applied
   and reported in the history. Use `bc_outer = free` so the corona can
   blow off and the ablation pressure emerges self-consistently — this
   replaces the prescribed pressure drive.
+  The **Langdon effect** (on by default, `langdon = false` to disable)
+  reduces IB absorption where IB heating distorts the electron
+  distribution: `kappa *= 1 - 0.553/(1 + (0.27/alpha)^0.75)` with
+  `alpha = Zbar v_osc^2/v_te^2` (the standard fit to Langdon, PRL 44, 575
+  (1980)), evaluated with the local intensity reconstructed from the
+  previous step's ray trace (oblique tube cross-section, capped near
+  turning points). Modest at 351 nm (~2 points of coupling on the example
+  capsule); grows as I lambda^2.
   (`hydro1d --raytrace DECK` prints per-ray turning radii and absorbed
   fractions for the initial state.)
+- **Fusion burn (burn-off diagnostics):** Bosch-Hale Maxwellian
+  reactivities for DT and both DD branches (verified against the published
+  tables to <0.5%), driven by the ion temperature and per-material D/T
+  atomic fractions (`xD`, `xT`). Yields, fusion power history, bang time,
+  burn width, burn-averaged Ti, and target gain are accumulated and
+  reported — but **nothing is fed back**: no charged-particle heating and
+  no reactant depletion, so the hydrodynamics is unchanged (self-heating
+  is a planned upgrade). Disable with `[burn] enabled = false`.
 - **Pressure drive (alternative):** a piecewise-linear-in-time applied
   pressure at the outer boundary (`[drive]` table + `bc_outer = pressure`)
   stands in for the ablation pressure when you don't want to model the
@@ -113,10 +129,10 @@ inertial-confinement-fusion capsule implosions driven by an applied
 - **Units:** CGS everywhere, temperatures in eV
   (1 Mbar = 1e12 dyn/cm^2).
 
-Not included (yet): DT burn/alpha heating, multigroup radiation,
-laser-plasma instabilities (the ray trace covers only refraction, inverse
-bremsstrahlung, and a critical-surface dump), electron degeneracy in the
-ideal EOS (use tables for degenerate/cold-matter regimes).
+Not included (yet): alpha-particle self-heating and fuel depletion (burn
+is diagnostic-only), multigroup radiation, laser-plasma instabilities
+beyond the Langdon effect (no CBET, SRS/SBS), cold-curve bonding in the
+ideal EOS (use tables for cold-matter fidelity).
 
 ## Building
 
@@ -192,10 +208,11 @@ See the examples for complete decks.
 | `[control]` | `t_end`, `dt_init`, `dt_max`, `cfl`, `dt_growth`, `max_steps`, `geometry` (planar/cylindrical/spherical), `temperatures` (1/2), `r_min`, `bc_outer` (wall/pressure/free), `c_quad`, `c_lin`, `T_floor` [eV] |
 | `[conduction]` | `enabled`, `flux_limiter`, `ln_lambda` (number or `auto`), `ion_conduction` (2T, default true), `ion_flux_limiter` |
 | `[radiation]` | `enabled`, `bc_outer` (insulated/vacuum) |
+| `[burn]` | `enabled` (default true; runs when a material has `xD`/`xT` set) |
 | `[drive]` | `table = t0 p0 t1 p1 ...` (s, dyn/cm^2), linearly interpolated, end values held |
-| `[laser]` | `enabled`, `wavelength_um`, `profile` (flattop/gaussian/supergaussian/table), `beam_radius` (cm), `sg_order`, `profile_table = r0 I0 r1 I1 ...` (cm, relative intensity), `rays`, `absorb_at_critical` (0–1), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
+| `[laser]` | `enabled`, `wavelength_um`, `profile` (flattop/gaussian/supergaussian/table), `beam_radius` (cm), `sg_order`, `profile_table = r0 I0 r1 I1 ...` (cm, relative intensity), `rays`, `absorb_at_critical` (0–1), `langdon` (default true), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
 | `[output]` | `directory`, `dt_dump` (s), `history_stride` |
-| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `degeneracy` (2T electrons, default true), `fuel` (counts toward shot-report fuel metrics), `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
+| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `degeneracy` (2T electrons, default true), `fuel` (counts toward shot-report fuel metrics), `xD`/`xT` (D/T ion fractions for burn), `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
 | `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), optional `Ti0`/`Te0` (2T), `Tr0` (radiation), `ratio` (outer/inner zone-width ratio) |
 
 ## Table file format
@@ -229,7 +246,9 @@ documents the intended OPLIB/TOPS workflow.
   fuel implosion speed, the in-flight fuel adiabat at that moment, IFAR at
   2/3 of the initial radius, convergence ratio, bang time (peak fuel rhoR,
   a no-burn proxy), peak fuel and total rhoR, hot-spot radius/Ti/Te/
-  pressure/rhoR at bang time, global extrema, and the floor/leak energy
+  pressure/rhoR at bang time, burn diagnostics (DT and DD-n neutron
+  yields, fusion energy and target gain, bang time as peak fusion power,
+  burn width, burn-averaged Ti), global extrema, and the floor/leak energy
   bookkeeping. Fuel metrics use materials flagged `fuel = true` (all zones
   if none are flagged); the hot spot is the innermost layer.
 - `snap_NNNNN.csv` — zone-by-zone state at each dump time: radii,
@@ -241,8 +260,9 @@ documents the intended OPLIB/TOPS workflow.
   max ion/electron temperature, central electron temperature, rhoR,
   internal/kinetic/radiation energy, cumulative drive work, cumulative
   absorbed laser energy, energy injected by the temperature floors,
-  radiation leaked through the boundary, and the relative
-  energy-conservation error `E_err = (E_int + E_kin + E_rad - E_0 -
+  radiation leaked through the boundary, the relative
+  energy-conservation error, instantaneous fusion power, and cumulative
+  neutron yield; the error is `E_err = (E_int + E_kin + E_rad - E_0 -
   W_drive - E_laser - E_floor + E_leak)/E`.
 
 ## Parallelism and design notes

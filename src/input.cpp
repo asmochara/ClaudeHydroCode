@@ -114,8 +114,9 @@ InputDeck parseDeck(const std::string& path) {
             } else if (section == "layer") {
                 deck.layers.emplace_back();
             } else if (section != "control" && section != "conduction" &&
-                       section != "radiation" && section != "output" &&
-                       section != "drive" && section != "laser") {
+                       section != "radiation" && section != "burn" &&
+                       section != "output" && section != "drive" &&
+                       section != "laser") {
                 fail("unknown section [" + section + "]");
             }
             continue;
@@ -161,6 +162,9 @@ InputDeck parseDeck(const std::string& path) {
             if      (key == "enabled")  rd.enabled = toBool(val, key);
             else if (key == "bc_outer") rd.bc_outer = val;
             else fail("unknown radiation key '" + key + "'");
+        } else if (section == "burn") {
+            if (key == "enabled") deck.burn.enabled = toBool(val, key);
+            else fail("unknown burn key '" + key + "'");
         } else if (section == "output") {
             auto& o = deck.output;
             if      (key == "directory")      o.directory = val;
@@ -180,6 +184,7 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "profile_table")  parseTimeTable(val, key, L.profile_table, fail);
             else if (key == "rays")           L.rays = toInt(val, key);
             else if (key == "absorb_at_critical") L.absorb_at_critical = toDouble(val, key);
+            else if (key == "langdon")        L.langdon = toBool(val, key);
             else if (key == "power")          parseTimeTable(val, key, L.power, fail);
             else fail("unknown laser key '" + key + "'");
         } else if (section == "material") {
@@ -195,6 +200,8 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "zbar_table")     m.zbar_table = val;
             else if (key == "degeneracy")     m.degeneracy = toBool(val, key);
             else if (key == "fuel")           m.fuel = toBool(val, key);
+            else if (key == "xD")             m.xD = toDouble(val, key);
+            else if (key == "xT")             m.xT = toDouble(val, key);
             else if (key == "opacity_table")  m.opacity_table = val;
             else if (key == "kappa_R")        m.kappa_R = toDouble(val, key);
             else if (key == "kappa_P")        m.kappa_P = toDouble(val, key);
@@ -256,6 +263,8 @@ InputDeck parseDeck(const std::string& path) {
             (m.kappa_R <= 0.0 || m.kappa_P <= 0.0))
             throw std::runtime_error(tag + "radiation is enabled; give 'opacity_table' "
                                      "or constant 'kappa_R' and 'kappa_P' [cm^2/g]");
+        if (m.xD < 0.0 || m.xT < 0.0 || m.xD + m.xT > 1.0 + 1e-12)
+            throw std::runtime_error(tag + "need xD, xT >= 0 with xD + xT <= 1");
     }
     if (deck.control.bc_outer != "wall" && deck.control.bc_outer != "pressure" &&
         deck.control.bc_outer != "free")

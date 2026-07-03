@@ -38,6 +38,7 @@ private:
     void buildRaySet();              // equal-power impact parameters from profile
     void laserStep(double dt);       // ray-traced deposition (dt=0: trace only)
     void couplingStep(double dt);    // electron-ion temperature relaxation (2T)
+    void burnStep(double dt);        // burn-off fusion diagnostics (no feedback)
     void conductionStep(double dt);  // electron (+ ion, in 2T) conduction
     void solveConduction(double dt, bool ion);
     void radiationStep(double dt);   // grey FLD + matter coupling
@@ -62,8 +63,11 @@ private:
     bool twoT_ = false;
     bool rad_ = false;
     bool laser_ = false;
+    bool burn_ = false;
     double ncrit_ = 0.0;          // critical electron density [1/cm^3]
     std::vector<double> rayB_;    // equal-power ray impact parameters [cm]
+    std::vector<double> Ilas_;    // local laser intensity [erg/s/cm^2], lagged
+                                  // one step, for the Langdon correction
 
     int M = 0;                    // number of zones (M+1 nodes)
     // Node-centered:
@@ -92,6 +96,13 @@ private:
 
     struct RayInfo { double b, rmin, fabs; };
     std::vector<RayInfo> rayDiag_;  // per-ray diagnostics from last laserStep
+
+    // ---- burn-off fusion accumulators ----
+    double Pfus = 0.0;            // instantaneous fusion power [erg/s]
+    double PfusMax = 0.0, tBangBurn = -1.0;
+    double YnDT = 0.0, YnDD = 0.0;  // cumulative neutron yields
+    double Efus = 0.0;              // cumulative fusion energy produced [erg]
+    double burnTiSum = 0.0, burnWSum = 0.0;  // burn-weighted <Ti> accumulators
 
     // ---- shot report (design scorecard, accumulated during the run) ----
     std::vector<char> fuelZone_;    // per-zone fuel flag

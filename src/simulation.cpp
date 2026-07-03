@@ -1,5 +1,6 @@
 #include "simulation.hpp"
 #include "constants.hpp"
+#include "fusion.hpp"
 #include "numerics.hpp"
 
 #include <algorithm>
@@ -56,6 +57,9 @@ Simulation::Simulation(const InputDeck& deck) : deck_(deck) {
         m.A = spec.A;
         m.Z = spec.Z;
         m.fuel = spec.fuel;
+        m.xD = spec.xD;
+        m.xT = spec.xT;
+        if (deck_.burn.enabled && (spec.xD > 0.0 || spec.xT > 0.0)) burn_ = true;
         m.zbar = makeZbarModel(spec.ionization, spec.Z, spec.A, spec.zbar_table);
         if (twoT_) {
             if (spec.eos == "ideal") {
@@ -449,10 +453,19 @@ void Simulation::laserStep(double dt) {
     const double Pt = L.powerAt(t);
     fabs_ = 0.0;
     rayDiag_.clear();
-    if (Pt <= 0.0) return;
+    if (Pt <= 0.0) {
+        Ilas_.assign(M, 0.0);
+        return;
+    }
     ElaserInc += Pt * dt;
 
     // Zone optics from the beginning-of-step state.
+    if (Ilas_.empty()) Ilas_.assign(M, 0.0);
+    const double lamCm = L.wavelength_um * 1e-4;
+    // v_osc^2 = 2 e^2 I lambda^2 / (pi me^2 c^3) (linear polarization).
+    const double voscCoef = 2.0 * phys::e_esu * phys::e_esu * lamCm * lamCm /
+                            (phys::pi * phys::m_e * phys::m_e *
+                             phys::c_light * phys::c_light * phys::c_light);
     std::vector<double> mu(M), kap(M);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -470,11 +483,24 @@ void Simulation::laserStep(double dt) {
             const double lnL = coulombLog(ne, Tel, Zeff);
             const double nu = 2.91e-6 * Zeff * ne * lnL / std::pow(Tel, 1.5);
             kap[k] = nu * x / (phys::c_light * mu[k]);
+            // Langdon effect: IB heating distorts the electron distribution
+            // toward a super-Gaussian, reducing absorption. Standard fit to
+            // Langdon (PRL 44, 575 (1980)):
+            //   R = 1 - 0.553 / (1 + (0.27/alpha)^0.75),
+            //   alpha = Zbar v_osc^2 / v_te^2,
+            // evaluated with the local intensity from the previous step's trace.
+            if (L.langdon && Ilas_[k] > 0.0) {
+                const double vte2 = Tel * phys::eV / phys::m_e;
+                const double alpha = Zeff * voscCoef * Ilas_[k] / vte2;
+                if (alpha > 1e-4)
+                    kap[k] *= 1.0 - 0.553 / (1.0 + std::pow(0.27 / alpha, 0.75));
+            }
         } else {
             mu[k] = 0.0;   // overdense: reflects at this zone's outer face
             kap[k] = 0.0;
         }
     }
+    std::vector<double> Inew(M, 0.0);  // local intensity gathered this trace
 
     std::vector<double> dep(M, 0.0);
     double absorbed = 0.0;
@@ -519,29 +545,34 @@ void Simulation::laserStep(double dt) {
         }
 
         // Attenuate: inward chords, optional critical dump, mirrored outward
-        // chords (the turning chord already covers both directions).
+        // chords (the turning chord already covers both directions). Each
+        // traversal also gathers the local intensity (ray power over the
+        // oblique tube cross-section, cos(theta) floored near turning points)
+        // used by next step's Langdon correction.
         double Prem = Pray;
-        for (const auto& s : segs) {
+        auto traverse = [&](const Seg& s) {
+            const double rc = 0.5 * (r[s.zone] + r[s.zone + 1]);
+            const double st = (mu[s.zone] > 0.0) ? b / (mu[s.zone] * rc) : 1.0;
+            const double ct = std::max(std::sqrt(std::max(1.0 - st * st, 0.0)), 0.1);
+            Inew[s.zone] += Prem / (area(rc) * ct);
             const double dP = Prem * (-std::expm1(-kap[s.zone] * s.len));
             dep[s.zone] += dP;
             Prem -= dP;
-        }
+        };
+        for (const auto& s : segs) traverse(s);
         if (critZone >= 0 && L.absorb_at_critical > 0.0) {
             const double dP = Prem * L.absorb_at_critical;
             dep[critZone] += dP;
             Prem -= dP;
         }
         const int nOut = static_cast<int>(segs.size()) - (turnedInShell ? 1 : 0);
-        for (int s = nOut - 1; s >= 0; --s) {
-            const double dP = Prem * (-std::expm1(-kap[segs[s].zone] * segs[s].len));
-            dep[segs[s].zone] += dP;
-            Prem -= dP;
-        }
+        for (int s = nOut - 1; s >= 0; --s) traverse(segs[s]);
         absorbed += Pray - Prem;  // remainder escapes back out
         rayDiag_.push_back({b, rmin, (Pray - Prem) / Pray});
     }
 
     fabs_ = absorbed / Pt;
+    Ilas_ = Inew;
     if (dt <= 0.0) return;  // trace-only mode (rayTraceReport)
     Elaser += absorbed * dt;
 
@@ -571,6 +602,47 @@ void Simulation::rayTraceReport() {
     for (const auto& ri : rayDiag_)
         std::printf("  %12.6e %14.6e %14.6e\n", ri.b, ri.rmin, ri.fabs);
     std::printf("# total absorbed fraction = %.6f\n", fabs_);
+}
+
+// Burn-off fusion diagnostics: Bosch-Hale DT and DD reaction rates from the
+// ion temperature, accumulated into yields and burn history. Nothing is fed
+// back -- no charged-particle heating and no reactant depletion -- so this
+// has zero effect on the hydrodynamics.
+void Simulation::burnStep(double dt) {
+    if (!burn_) return;
+    double pf = 0.0, yn_dt = 0.0, yn_dd = 0.0, tiw = 0.0, wsum = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) \
+    reduction(+ : pf, yn_dt, yn_dd, tiw, wsum)
+#endif
+    for (int k = 0; k < M; ++k) {
+        const auto& m = mats_[matid[k]];
+        if (m.xD <= 0.0) continue;
+        const double TkeV = (twoT_ ? Ti[k] : T[k]) * 1e-3;
+        if (TkeV < 0.2) continue;
+        const double ni = rho[k] / (m.A * phys::m_p);
+        const double nD = m.xD * ni, nT = m.xT * ni;
+        const double V = volume(r[k], r[k + 1]);
+        const double rDT = nD * nT * sigmavDT(TkeV);          // reactions/cm^3/s
+        const double rDDn = 0.5 * nD * nD * sigmavDDn(TkeV);
+        const double rDDp = 0.5 * nD * nD * sigmavDDp(TkeV);
+        pf += (rDT * fusion::Q_DT + rDDn * fusion::Q_DDn + rDDp * fusion::Q_DDp) * V;
+        yn_dt += rDT * V * dt;
+        yn_dd += rDDn * V * dt;
+        const double w = rDT * V * dt;
+        tiw += w * TkeV;
+        wsum += w;
+    }
+    Pfus = pf;
+    YnDT += yn_dt;
+    YnDD += yn_dd;
+    Efus += pf * dt;
+    burnTiSum += tiw;
+    burnWSum += wsum;
+    if (pf > PfusMax) {
+        PfusMax = pf;
+        tBangBurn = t;
+    }
 }
 
 void Simulation::couplingStep(double dt) {
@@ -834,7 +906,7 @@ void Simulation::writeHistoryHeader() {
     std::ofstream out(histPath_);
     out << "step,t,dt,r_outer,u_outer,p_drive,P_laser,f_abs,rho_max,Ti_max,"
            "Te_max,Te_center,rhoR,E_int,E_kin,E_rad,W_drive,E_laser,E_floor,"
-           "E_leak,E_err\n";
+           "E_leak,E_err,P_fus,Y_n\n";
 }
 
 void Simulation::writeHistoryRow() {
@@ -862,7 +934,8 @@ void Simulation::writeHistoryRow() {
         << rhomax << ',' << Timax << ','
         << Temax << ',' << (twoT_ ? Te[0] : T[0]) << ',' << rhoR << ','
         << Eint << ',' << Ekin << ',' << Erad << ',' << driveWork << ','
-        << Elaser << ',' << Efloor << ',' << Eleak << ',' << err << '\n';
+        << Elaser << ',' << Efloor << ',' << Eleak << ',' << err << ','
+        << Pfus << ',' << YnDT + YnDD << '\n';
 }
 
 // Mass-weighted adiabat alpha = P / P_Fermi(rho) of the dense fuel shell
@@ -1009,6 +1082,21 @@ void Simulation::writeReport() const {
         add("                    <P> = %.3g dyn/cm^2 (%.2f Gbar), rhoR = %.3g g/cm^2",
             R.hsP, R.hsP / 1e15, R.hsRhoR);
     }
+    if (burn_) {
+        add("burn (diagnostic only, no self-heating):");
+        add("  DT neutron yield      = %.4g  (DD-n yield: %.3g)", YnDT, YnDD);
+        add("  fusion energy         = %.4g erg (%.3g kJ)", Efus, Efus / 1e10);
+        const double Ein = laser_ ? ElaserInc : driveWork;
+        if (Ein > 0.0)
+            add("  target gain           = %.3g (vs %s energy)",
+                Efus / Ein, laser_ ? "incident laser" : "drive work");
+        add("  bang time (peak fusion power) = %.4g s, peak P_fus = %.4g erg/s",
+            tBangBurn, PfusMax);
+        if (PfusMax > 0.0)
+            add("  burn width (E_fus/P_fus,peak) = %.3g s", Efus / PfusMax);
+        if (burnWSum > 0.0)
+            add("  burn-averaged Ti      = %.3g keV", burnTiSum / burnWSum);
+    }
     add("extrema: rho_max = %.4g g/cc, Ti_max = %.4g eV, Te_max = %.4g eV, "
         "E_kin_max = %.4g erg", R.rhoMax, R.TiMax, R.TeMax, R.EkinMax);
     add("energy bookkeeping: floors injected %.3g erg, radiation leaked %.3g erg",
@@ -1047,6 +1135,7 @@ void Simulation::run() {
         couplingStep(dt_);
         conductionStep(dt_);
         radiationStep(dt_);
+        burnStep(dt_);
         if (refresh) {
             updateEosDerived();
             applyFloors();

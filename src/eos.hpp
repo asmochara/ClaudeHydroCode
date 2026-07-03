@@ -128,6 +128,7 @@ struct Material {
     double A = 1.0;                       // mean atomic mass [amu]
     double Z = 1.0;                       // nuclear charge (or fixed Zbar)
     bool fuel = false;                    // counts toward fuel shot-report metrics
+    double xD = 0.0, xT = 0.0;            // D/T atomic fractions (burn diagnostics)
     std::shared_ptr<ZbarModel> zbar;
     std::shared_ptr<EOS> eos;             // 1T mode
     std::shared_ptr<SpeciesEOS> ion, ele; // 2T mode

@@ -15,6 +15,7 @@ add_executable(hydro1d
   src/input.cpp
   src/table2d.cpp
   src/eos.cpp
+  src/fusion.cpp
   src/zbar.cpp
   src/opacity.cpp
   src/simulation.cpp

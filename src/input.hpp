@@ -36,6 +36,14 @@ struct RadiationSpec {
     std::string bc_outer = "insulated";  // "insulated" or "vacuum" (Marshak leak)
 };
 
+struct BurnSpec {
+    // Burn-off fusion diagnostics (Bosch-Hale DT + DD reactivities from the
+    // ion temperature): yields, burn history, burn-averaged Ti. Nothing is
+    // deposited back and no fuel is depleted (no self-heating). Runs when
+    // enabled and at least one material has xD/xT set.
+    bool enabled = true;
+};
+
 struct OutputSpec {
     std::string directory = "output";
     double dt_dump = -1.0;       // snapshot interval [s]; <0 = start/end only
@@ -55,6 +63,8 @@ struct MaterialSpec {
     std::string zbar_table;      // Zbar(rho,T) table (ionization=table)
     bool degeneracy = true;      // electron Fermi degeneracy (2T ideal EOS)
     bool fuel = false;           // counts toward fuel metrics in the shot report
+    double xD = 0.0;             // deuterium atomic fraction (of all ions)
+    double xT = 0.0;             // tritium atomic fraction (of all ions)
     std::string opacity_table;   // kappa_R,kappa_P table; else constants below
     double kappa_R = -1.0;       // [cm^2/g] constant Rosseland mean
     double kappa_P = -1.0;       // [cm^2/g] constant Planck mean
@@ -111,6 +121,8 @@ struct LaserSpec {
                                       // at the critical surface (resonance-
                                       // absorption stand-in; also bootstraps
                                       // absorption before a corona exists)
+    bool langdon = true;              // Langdon-effect reduction of IB
+                                      // absorption where Z v_osc^2/v_te^2 ~ 1
     // Total power on target from all beams: (time [s], power [erg/s]) pairs.
     std::vector<std::pair<double, double>> power;
     double powerAt(double t) const { return interpTimeTable(power, t); }
@@ -120,6 +132,7 @@ struct InputDeck {
     ControlSpec control;
     ConductionSpec conduction;
     RadiationSpec radiation;
+    BurnSpec burn;
     OutputSpec output;
     std::map<std::string, MaterialSpec> materials;
     std::vector<LayerSpec> layers;
