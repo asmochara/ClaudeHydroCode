@@ -28,6 +28,7 @@ gamma      = 1.6666667
 A          = 2.5
 Z          = 1.0
 ionization = fixed
+degeneracy = false   # keep cv_e = cv_i so the analytic 200 eV check holds
 
 [layer]
 material  = dt

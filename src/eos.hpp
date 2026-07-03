@@ -82,16 +82,30 @@ private:
     double gamma_, R0_;
 };
 
+// Electron gas with optional Fermi degeneracy. With degeneracy on, the
+// pressure interpolates between the classical and T=0 Fermi limits as
+// P_e = sqrt(P_cl^2 + P_F0^2) (exact in both limits, ~15% worst-case error
+// near theta ~ 1), and e_e = (3/2) P_e / rho, which is the exact relation
+// for a nonrelativistic Fermi gas at any degeneracy — so P and e stay
+// thermodynamically consistent. No cold-curve (bonding) term: uncompressed
+// solids carry their zero-point pressure unbalanced (fine once the drive
+// exceeds ~Mbar; use tabular EOS for cold-matter fidelity).
 class IdealElectronEOS : public SpeciesEOS {
 public:
-    IdealElectronEOS(double gamma, double A, std::shared_ptr<const ZbarModel> zb);
+    IdealElectronEOS(double gamma, double A, std::shared_ptr<const ZbarModel> zb,
+                     bool degeneracy);
     double pressure(double rho, double T) const override;
     double energy(double rho, double T) const override;
     double cs2Contribution(double rho, double T) const override;
 private:
     double gamma_, R0_;
+    bool deg_;
     std::shared_ptr<const ZbarModel> zb_;
 };
+
+// T=0 electron Fermi pressure at full ionization: the ICF adiabat reference
+// P_F0 = (2/5) ne E_F (~2.2 rho^{5/3} Mbar for DT).
+double fermiPressure0(double rho, double Zfull, double A);
 
 // Tabulated species EOS (e.g. SESAME/LEOS electron or ion sub-tables),
 // same two-block file format as the total tabulated EOS.
@@ -113,6 +127,7 @@ struct Material {
     std::string name;
     double A = 1.0;                       // mean atomic mass [amu]
     double Z = 1.0;                       // nuclear charge (or fixed Zbar)
+    bool fuel = false;                    // counts toward fuel shot-report metrics
     std::shared_ptr<ZbarModel> zbar;
     std::shared_ptr<EOS> eos;             // 1T mode
     std::shared_ptr<SpeciesEOS> ion, ele; // 2T mode

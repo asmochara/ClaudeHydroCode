@@ -28,7 +28,15 @@ inertial-confinement-fusion capsule implosions driven by an applied
   - `ideal`: ideal ion + electron gases with mean ionization Zbar from the
     ionization model (below); in 1T mode
     `P = rho (1+Zbar) kB T / (A m_p)`, in 2T mode the ion and electron
-    partial EOS are separate; or
+    partial EOS are separate. In 2T mode the electrons include **Fermi
+    degeneracy** by default (`degeneracy = false` to disable):
+    `P_e = sqrt(P_classical^2 + P_Fermi0^2)`, exact in both limits, with
+    `e_e = (3/2) P_e/rho` (the exact nonrelativistic Fermi-gas relation, so
+    P and e stay thermodynamically consistent). This makes the compressed
+    fuel correctly stiff and the ICF adiabat `alpha = P/P_Fermi` meaningful;
+    note there is no cold-curve (bonding) term, so uncompressed solids carry
+    their sub-Mbar zero-point pressure unbalanced — fine once the drive
+    exceeds ~1 Mbar, use tabular EOS for cold-matter fidelity. Or
   - `table`: bilinear lookup of `P(rho,T)` and `e(rho,T)` on a rectangular
     grid (interpolated in log rho, log T) with robust `T(rho,e)` inversion
     and a thermodynamically consistent sound speed. In 2T mode give
@@ -165,8 +173,8 @@ Example decks (all runtimes seconds on one core):
   expanding corona refracts rays away from the shrinking target — all
   resolved by the ray trace. The un-optimized pulse plus radiative preheat
   from the crude demo opacities give a modest but complete implosion
-  (~155 km/s shell, convergence ratio ~26, ~50 g/cc fuel, ~1.5 keV hot
-  spot); pulse-shape and opacity fidelity are left to the user.
+  (~130 km/s shell, convergence ratio ~29, ~50 g/cc fuel at adiabat ~1.5);
+  pulse-shape and opacity fidelity are left to the user.
 
 Quick-look plotting (requires matplotlib + pandas):
 
@@ -187,7 +195,7 @@ See the examples for complete decks.
 | `[drive]` | `table = t0 p0 t1 p1 ...` (s, dyn/cm^2), linearly interpolated, end values held |
 | `[laser]` | `enabled`, `wavelength_um`, `profile` (flattop/gaussian/supergaussian/table), `beam_radius` (cm), `sg_order`, `profile_table = r0 I0 r1 I1 ...` (cm, relative intensity), `rays`, `absorb_at_critical` (0–1), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
 | `[output]` | `directory`, `dt_dump` (s), `history_stride` |
-| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
+| `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `degeneracy` (2T electrons, default true), `fuel` (counts toward shot-report fuel metrics), `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
 | `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), optional `Ti0`/`Te0` (2T), `Tr0` (radiation), `ratio` (outer/inner zone-width ratio) |
 
 ## Table file format
@@ -216,17 +224,26 @@ documents the intended OPLIB/TOPS workflow.
 
 ## Output
 
+- `report.txt` (also printed at end of run) — the shot report: absorbed
+  laser energy and coupling efficiency (or drive work), peak mass-averaged
+  fuel implosion speed, the in-flight fuel adiabat at that moment, IFAR at
+  2/3 of the initial radius, convergence ratio, bang time (peak fuel rhoR,
+  a no-burn proxy), peak fuel and total rhoR, hot-spot radius/Ti/Te/
+  pressure/rhoR at bang time, global extrema, and the floor/leak energy
+  bookkeeping. Fuel metrics use materials flagged `fuel = true` (all zones
+  if none are flagged); the hot spot is the innermost layer.
 - `snap_NNNNN.csv` — zone-by-zone state at each dump time: radii,
   velocities, rho, Ti, Te, Tr (radiation temperature), Zbar, matter
   pressure, specific internal energy, sound speed, artificial viscosity,
-  material.
+  adiabat alpha = P/P_Fermi, material.
 - `history.csv` — per-step time series: outer radius/velocity, drive
   pressure, laser power and instantaneous absorbed fraction, max density,
   max ion/electron temperature, central electron temperature, rhoR,
   internal/kinetic/radiation energy, cumulative drive work, cumulative
-  absorbed laser energy, radiation leaked through the boundary, and the
-  relative energy-conservation error
-  `E_err = (E_int + E_kin + E_rad - E_0 - W_drive - E_laser + E_leak)/E`.
+  absorbed laser energy, energy injected by the temperature floors,
+  radiation leaked through the boundary, and the relative
+  energy-conservation error `E_err = (E_int + E_kin + E_rad - E_0 -
+  W_drive - E_laser - E_floor + E_leak)/E`.
 
 ## Parallelism and design notes
 

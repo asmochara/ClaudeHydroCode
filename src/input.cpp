@@ -193,6 +193,8 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "table_electron") m.table_electron = val;
             else if (key == "ionization")     m.ionization = val;
             else if (key == "zbar_table")     m.zbar_table = val;
+            else if (key == "degeneracy")     m.degeneracy = toBool(val, key);
+            else if (key == "fuel")           m.fuel = toBool(val, key);
             else if (key == "opacity_table")  m.opacity_table = val;
             else if (key == "kappa_R")        m.kappa_R = toDouble(val, key);
             else if (key == "kappa_P")        m.kappa_P = toDouble(val, key);

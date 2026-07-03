@@ -47,6 +47,9 @@ private:
     void writeSnapshot(int index) const;
     void writeHistoryHeader();
     void writeHistoryRow();
+    void updateReport();             // running design metrics (per step)
+    void writeReport() const;        // end-of-run shot report
+    double fuelAdiabat() const;      // mass-weighted alpha of the dense fuel shell
 
     double zoneKappa(int j) const;      // Spitzer electron conductivity [1/(cm s)]
     double zoneKappaIon(int j) const;   // Braginskii ion conductivity [1/(cm s)]
@@ -82,10 +85,29 @@ private:
     double driveWork = 0.0;       // cumulative boundary work done on the system
     double Eleak = 0.0;           // cumulative radiation lost through boundary
     double Elaser = 0.0;          // cumulative laser energy absorbed
+    double Efloor = 0.0;          // cumulative energy injected by T/Er floors
     double fabs_ = 0.0;           // instantaneous absorbed laser fraction
     double E0 = 0.0;              // initial total energy
     std::string histPath_;
 
     struct RayInfo { double b, rmin, fabs; };
     std::vector<RayInfo> rayDiag_;  // per-ray diagnostics from last laserStep
+
+    // ---- shot report (design scorecard, accumulated during the run) ----
+    std::vector<char> fuelZone_;    // per-zone fuel flag
+    bool noFuelFlag_ = false;       // no material was marked fuel = true
+    int hsNode_ = 0;                // node bounding the innermost layer (hot spot)
+    double rIf0_ = 0.0;             // initial hot-spot boundary radius
+    double ElaserInc = 0.0;         // cumulative incident laser energy
+    struct Report {
+        double vImp = 0, tVImp = -1;        // peak fuel implosion speed
+        double adiabat = -1;                //   ... fuel adiabat at that time
+        double rhoRFuel = 0, tBang = -1;    // peak fuel rhoR ("bang" proxy)
+        double rhoRTotAtBang = 0;
+        double hsR = 0, hsTi = 0, hsTe = 0, hsP = 0, hsRhoR = 0;  // at bang
+        double rIfMin = 1e300;              // for convergence ratio
+        double ifar = -1, tIfar = -1;       // at hot-spot radius = 2/3 initial
+        double rhoMax = 0, TiMax = 0, TeMax = 0, EkinMax = 0;
+        double pDriveMax = 0, pLaserMax = 0;
+    } rep_;
 };

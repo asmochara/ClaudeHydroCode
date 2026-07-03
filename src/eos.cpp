@@ -123,17 +123,37 @@ double IdealIonEOS::cs2Contribution(double rho, double T) const {
 
 // ------------------------------------------------------------ IdealElectronEOS
 
+namespace {
+// T=0 Fermi pressure of an electron gas of density ne [cm^-3].
+inline double fermiP0(double ne) {
+    constexpr double c1 = phys::hbar * phys::hbar / (2.0 * phys::m_e);
+    const double EF = c1 * std::pow(3.0 * phys::pi * phys::pi * ne, 2.0 / 3.0);
+    return 0.4 * ne * EF;
+}
+}  // namespace
+
+double fermiPressure0(double rho, double Zfull, double A) {
+    return fermiP0(rho * Zfull / (A * phys::m_p));
+}
+
 IdealElectronEOS::IdealElectronEOS(double gamma, double A,
-                                   std::shared_ptr<const ZbarModel> zb)
-    : gamma_(gamma), R0_(phys::eV / (A * phys::m_p)), zb_(std::move(zb)) {
+                                   std::shared_ptr<const ZbarModel> zb,
+                                   bool degeneracy)
+    : gamma_(gamma), R0_(phys::eV / (A * phys::m_p)), deg_(degeneracy),
+      zb_(std::move(zb)) {
     if (gamma <= 1.0) throw std::runtime_error("IdealElectronEOS: gamma must be > 1");
 }
 
 double IdealElectronEOS::pressure(double rho, double T) const {
-    return rho * R0_ * zb_->zbar(rho, T) * T;
+    const double zb = zb_->zbar(rho, T);
+    const double Pcl = rho * R0_ * zb * T;
+    if (!deg_) return Pcl;
+    const double P0 = fermiP0(rho * zb * R0_ / phys::eV);  // ne = rho zb/(A mp)
+    return std::sqrt(Pcl * Pcl + P0 * P0);
 }
 
 double IdealElectronEOS::energy(double rho, double T) const {
+    if (deg_) return 1.5 * pressure(rho, T) / rho;  // exact for nonrel. Fermi gas
     return R0_ * zb_->zbar(rho, T) * T / (gamma_ - 1.0);
 }
 

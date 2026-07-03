@@ -33,6 +33,7 @@ gamma      = 1.6666667
 A          = 2.5
 Z          = 1.0
 ionization = fixed
+degeneracy = false   # classical electrons for the analytic energy budget
 kappa_R    = 10.0
 kappa_P    = 10.0
 

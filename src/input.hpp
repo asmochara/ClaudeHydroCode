@@ -53,6 +53,8 @@ struct MaterialSpec {
     std::string table_electron;  // electron EOS table (2T mode, eos=table)
     std::string ionization = "fixed";  // "fixed" | "tf" (Thomas-Fermi) | "table"
     std::string zbar_table;      // Zbar(rho,T) table (ionization=table)
+    bool degeneracy = true;      // electron Fermi degeneracy (2T ideal EOS)
+    bool fuel = false;           // counts toward fuel metrics in the shot report
     std::string opacity_table;   // kappa_R,kappa_P table; else constants below
     double kappa_R = -1.0;       // [cm^2/g] constant Rosseland mean
     double kappa_P = -1.0;       // [cm^2/g] constant Planck mean

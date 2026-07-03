@@ -55,11 +55,13 @@ Simulation::Simulation(const InputDeck& deck) : deck_(deck) {
         m.name = name;
         m.A = spec.A;
         m.Z = spec.Z;
+        m.fuel = spec.fuel;
         m.zbar = makeZbarModel(spec.ionization, spec.Z, spec.A, spec.zbar_table);
         if (twoT_) {
             if (spec.eos == "ideal") {
                 m.ion = std::make_shared<IdealIonEOS>(spec.gamma, spec.A);
-                m.ele = std::make_shared<IdealElectronEOS>(spec.gamma, spec.A, m.zbar);
+                m.ele = std::make_shared<IdealElectronEOS>(spec.gamma, spec.A, m.zbar,
+                                                           spec.degeneracy);
             } else {
                 m.ion = std::make_shared<TableSpeciesEOS>(spec.table_ion);
                 m.ele = std::make_shared<TableSpeciesEOS>(spec.table_electron);
@@ -193,6 +195,17 @@ void Simulation::setupMesh() {
     dmNode[0] = 0.5 * dm[0];
     dmNode[M] = 0.5 * dm[M - 1];
 
+    // Shot-report bookkeeping: fuel zones and the hot-spot boundary (the
+    // outer node of the innermost layer).
+    fuelZone_.assign(M, 0);
+    noFuelFlag_ = true;
+    for (int k = 0; k < M; ++k)
+        if (mats_[matid[k]].fuel) { fuelZone_[k] = 1; noFuelFlag_ = false; }
+    if (noFuelFlag_)
+        for (int k = 0; k < M; ++k) fuelZone_[k] = 1;  // fall back to all zones
+    hsNode_ = deck_.layers.front().zones;
+    rIf0_ = r[hsNode_];
+
     updateEosDerived();
 
     E0 = 0.0;  // starts at rest
@@ -234,12 +247,33 @@ void Simulation::applyFloors() {
     for (int k = 0; k < M; ++k) {
         const auto& m = mats_[matid[k]];
         if (twoT_) {
-            if (Ti[k] < Tf) { Ti[k] = Tf; ei[k] = m.ion->energy(rho[k], Tf); }
-            if (Te[k] < Tf) { Te[k] = Tf; ee[k] = m.ele->energy(rho[k], Tf); }
+            if (Ti[k] < Tf) {
+                const double en = m.ion->energy(rho[k], Tf);
+                Efloor += dm[k] * (en - ei[k]);
+                Ti[k] = Tf;
+                ei[k] = en;
+            }
+            if (Te[k] < Tf) {
+                const double en = m.ele->energy(rho[k], Tf);
+                Efloor += dm[k] * (en - ee[k]);
+                Te[k] = Tf;
+                ee[k] = en;
+            }
         } else {
-            if (T[k] < Tf) { T[k] = Tf; e[k] = m.eos->energy(rho[k], Tf); }
+            if (T[k] < Tf) {
+                const double en = m.eos->energy(rho[k], Tf);
+                Efloor += dm[k] * (en - e[k]);
+                T[k] = Tf;
+                e[k] = en;
+            }
         }
-        if (rad_) Er[k] = std::max(Er[k], phys::a_rad * Tf * Tf * Tf * Tf * 1e-6);
+        if (rad_) {
+            const double Emin = phys::a_rad * Tf * Tf * Tf * Tf * 1e-6;
+            if (Er[k] < Emin) {
+                Efloor += (Emin - Er[k]) * volume(r[k], r[k + 1]);
+                Er[k] = Emin;
+            }
+        }
     }
 }
 
@@ -416,6 +450,7 @@ void Simulation::laserStep(double dt) {
     fabs_ = 0.0;
     rayDiag_.clear();
     if (Pt <= 0.0) return;
+    ElaserInc += Pt * dt;
 
     // Zone optics from the beginning-of-step state.
     std::vector<double> mu(M), kap(M);
@@ -610,12 +645,6 @@ void Simulation::solveConduction(double dt, bool ion) {
                          : deck_.conduction.flux_limiter;
     std::vector<double>& Tc = ion ? Ti : (twoT_ ? Te : T);
     std::vector<double>& ec = ion ? ei : (twoT_ ? ee : e);
-    auto energyOf = [&](int k, double Tx) {
-        const auto& m = mats_[matid[k]];
-        return ion ? m.ion->energy(rho[k], Tx)
-                   : (twoT_ ? m.ele->energy(rho[k], Tx)
-                            : m.eos->energy(rho[k], Tx));
-    };
 
     // Zone centers, heat capacities, conductivities, free-streaming fluxes.
     std::vector<double> rc(M), cv(M), kap(M), qf(M);
@@ -677,15 +706,20 @@ void Simulation::solveConduction(double dt, bool ion) {
     }
     thomasSolve(a, b, cc, d, Tn);
 
-    // Update internal energy consistently with the EOS at constant density.
-    const double Tf = deck_.control.T_floor;
+    // Energy update in flux form: the solved temperature field defines the
+    // face fluxes, and zone energies change by their divergence. This is
+    // exactly conservative even when e(T) is nonlinear (TF ionization,
+    // degeneracy); temperatures are then re-inverted from the energies.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int k = 0; k < M; ++k) {
-        const double Tnew = std::max(Tn[k], Tf);
-        ec[k] += energyOf(k, Tnew) - energyOf(k, Tc[k]);
-        Tc[k] = Tnew;
+        const double fluxIn = (k > 0 ? G[k] * (Tn[k - 1] - Tn[k]) : 0.0) +
+                              (k < M - 1 ? G[k + 1] * (Tn[k + 1] - Tn[k]) : 0.0);
+        ec[k] += dt * fluxIn / dm[k];
+        Tc[k] = ion ? mats_[matid[k]].ion->temperature(rho[k], ec[k], Tn[k])
+                    : (twoT_ ? mats_[matid[k]].ele->temperature(rho[k], ec[k], Tn[k])
+                             : mats_[matid[k]].eos->temperature(rho[k], ec[k], Tn[k]));
     }
 }
 
@@ -777,19 +811,21 @@ void Simulation::writeSnapshot(int index) const {
     std::ofstream out(std::filesystem::path(deck_.output.directory) / name);
     out << "# t = " << t << " s, step = " << step << "\n";
     out << "zone,material,r_left,r_right,r_center,u_left,u_right,rho,"
-           "Ti_eV,Te_eV,Tr_eV,zbar,P,e,cs,q\n";
+           "Ti_eV,Te_eV,Tr_eV,zbar,P,e,cs,q,alpha\n";
     out.precision(9);
     for (int k = 0; k < M; ++k) {
+        const auto& m = mats_[matid[k]];
         const double Tik = twoT_ ? Ti[k] : T[k];
         const double Tek = twoT_ ? Te[k] : T[k];
         const double Trk = rad_ ? std::pow(Er[k] / phys::a_rad, 0.25) : 0.0;
         const double ek = twoT_ ? ei[k] + ee[k] : e[k];
-        out << k << ',' << mats_[matid[k]].name << ','
+        const double alpha = P[k] / fermiPressure0(rho[k], m.Z, m.A);
+        out << k << ',' << m.name << ','
             << r[k] << ',' << r[k + 1] << ',' << 0.5 * (r[k] + r[k + 1]) << ','
             << u[k] << ',' << u[k + 1] << ','
             << rho[k] << ',' << Tik << ',' << Tek << ',' << Trk << ','
             << zb[k] << ',' << P[k] << ',' << ek << ',' << cs[k] << ',' << q[k]
-            << '\n';
+            << ',' << alpha << '\n';
     }
 }
 
@@ -797,7 +833,8 @@ void Simulation::writeHistoryHeader() {
     histPath_ = (std::filesystem::path(deck_.output.directory) / "history.csv").string();
     std::ofstream out(histPath_);
     out << "step,t,dt,r_outer,u_outer,p_drive,P_laser,f_abs,rho_max,Ti_max,"
-           "Te_max,Te_center,rhoR,E_int,E_kin,E_rad,W_drive,E_laser,E_leak,E_err\n";
+           "Te_max,Te_center,rhoR,E_int,E_kin,E_rad,W_drive,E_laser,E_floor,"
+           "E_leak,E_err\n";
 }
 
 void Simulation::writeHistoryRow() {
@@ -815,7 +852,7 @@ void Simulation::writeHistoryRow() {
     const double Etot = Eint + Ekin + Erad;
     const double scale = std::max({std::abs(Etot), std::abs(driveWork),
                                    std::abs(Elaser), std::abs(E0), 1e-300});
-    const double err = (Etot - E0 - driveWork - Elaser + Eleak) / scale;
+    const double err = (Etot - E0 - driveWork - Elaser - Efloor + Eleak) / scale;
 
     std::ofstream out(histPath_, std::ios::app);
     out.precision(9);
@@ -825,7 +862,162 @@ void Simulation::writeHistoryRow() {
         << rhomax << ',' << Timax << ','
         << Temax << ',' << (twoT_ ? Te[0] : T[0]) << ',' << rhoR << ','
         << Eint << ',' << Ekin << ',' << Erad << ',' << driveWork << ','
-        << Elaser << ',' << Eleak << ',' << err << '\n';
+        << Elaser << ',' << Efloor << ',' << Eleak << ',' << err << '\n';
+}
+
+// Mass-weighted adiabat alpha = P / P_Fermi(rho) of the dense fuel shell
+// (fuel zones within 1/e of the peak fuel density). P_Fermi is the T=0
+// electron Fermi pressure at full ionization -- the standard ICF reference
+// (~2.2 rho^{5/3} Mbar for DT).
+double Simulation::fuelAdiabat() const {
+    double rhomax = 0.0;
+    for (int k = 0; k < M; ++k)
+        if (fuelZone_[k]) rhomax = std::max(rhomax, rho[k]);
+    if (rhomax <= 0.0) return -1.0;
+    const double thresh = rhomax / 2.718281828;
+    double msum = 0.0, asum = 0.0;
+    for (int k = 0; k < M; ++k) {
+        if (!fuelZone_[k] || rho[k] < thresh) continue;
+        const auto& m = mats_[matid[k]];
+        asum += dm[k] * P[k] / fermiPressure0(rho[k], m.Z, m.A);
+        msum += dm[k];
+    }
+    return (msum > 0.0) ? asum / msum : -1.0;
+}
+
+void Simulation::updateReport() {
+    auto& R = rep_;
+    // Global extrema.
+    double Ekin = 0.0;
+    for (int i = 0; i <= M; ++i) Ekin += 0.5 * dmNode[i] * u[i] * u[i];
+    R.EkinMax = std::max(R.EkinMax, Ekin);
+    for (int k = 0; k < M; ++k) {
+        R.rhoMax = std::max(R.rhoMax, rho[k]);
+        R.TiMax = std::max(R.TiMax, twoT_ ? Ti[k] : T[k]);
+        R.TeMax = std::max(R.TeMax, twoT_ ? Te[k] : T[k]);
+    }
+    R.pDriveMax = std::max(R.pDriveMax, deck_.drive.pressure(t));
+    if (laser_) R.pLaserMax = std::max(R.pLaserMax, deck_.laser.powerAt(t));
+
+    // Fuel implosion speed (mass-averaged, inward positive) and adiabat.
+    double msum = 0.0, mv = 0.0, rrf = 0.0, rrtot = 0.0;
+    for (int k = 0; k < M; ++k) {
+        const double dr = r[k + 1] - r[k];
+        rrtot += rho[k] * dr;
+        if (!fuelZone_[k]) continue;
+        msum += dm[k];
+        mv += dm[k] * 0.5 * (u[k] + u[k + 1]);
+        rrf += rho[k] * dr;
+    }
+    const double vin = (msum > 0.0) ? -mv / msum : 0.0;
+    if (vin > R.vImp) {
+        R.vImp = vin;
+        R.tVImp = t;
+        R.adiabat = fuelAdiabat();
+    }
+
+    // Peak fuel compression ("bang" proxy without burn) and hot-spot state.
+    if (rrf > R.rhoRFuel) {
+        R.rhoRFuel = rrf;
+        R.rhoRTotAtBang = rrtot;
+        R.tBang = t;
+        R.hsR = r[hsNode_];
+        double mh = 0.0, ti = 0.0, te = 0.0, ph = 0.0, rr = 0.0;
+        for (int k = 0; k < hsNode_ && k < M; ++k) {
+            mh += dm[k];
+            ti += dm[k] * (twoT_ ? Ti[k] : T[k]);
+            te += dm[k] * (twoT_ ? Te[k] : T[k]);
+            ph += dm[k] * P[k];
+            rr += rho[k] * (r[k + 1] - r[k]);
+        }
+        if (mh > 0.0) {
+            R.hsTi = ti / mh;
+            R.hsTe = te / mh;
+            R.hsP = ph / mh;
+            R.hsRhoR = rr;
+        }
+    }
+
+    // Convergence and in-flight aspect ratio at 2/3 of the initial radius.
+    R.rIfMin = std::min(R.rIfMin, r[hsNode_]);
+    if (R.ifar < 0.0 && rIf0_ > 0.0 && r[hsNode_] < (2.0 / 3.0) * rIf0_) {
+        double rhomax = 0.0;
+        for (int k = 0; k < M; ++k)
+            if (fuelZone_[k]) rhomax = std::max(rhomax, rho[k]);
+        const double thresh = rhomax / 2.718281828;
+        double Rsh = 0.0, dRsh = 0.0;
+        for (int k = 0; k < M; ++k) {
+            if (!fuelZone_[k] || rho[k] < thresh) continue;
+            Rsh = std::max(Rsh, r[k + 1]);
+            dRsh += r[k + 1] - r[k];
+        }
+        if (dRsh > 0.0) {
+            R.ifar = Rsh / dRsh;
+            R.tIfar = t;
+        }
+    }
+}
+
+void Simulation::writeReport() const {
+    const auto& R = rep_;
+    std::string txt;
+    char line[256];
+    auto add = [&](const char* fmt, auto... args) {
+        if constexpr (sizeof...(args) == 0) {
+            txt += fmt;
+        } else {
+            std::snprintf(line, sizeof(line), fmt, args...);
+            txt += line;
+        }
+        txt += '\n';
+    };
+
+    add("=============== hydro1d shot report ===============");
+    add("run: %d zones, %s, conduction %s, radiation %s, laser %s",
+        M, twoT_ ? "2T" : "1T", deck_.conduction.enabled ? "on" : "off",
+        rad_ ? "on" : "off", laser_ ? "on" : "off");
+    add("end: t = %.4g s in %ld steps", t, step);
+    if (noFuelFlag_)
+        add("NOTE: no material has 'fuel = true'; fuel metrics use all zones");
+
+    if (laser_) {
+        add("laser: E_inc = %.4g erg (%.1f kJ), absorbed = %.4g erg (%.1f kJ), "
+            "coupling = %.1f%%, peak power = %.3g erg/s",
+            ElaserInc, ElaserInc / 1e10, Elaser, Elaser / 1e10,
+            (ElaserInc > 0.0) ? 100.0 * Elaser / ElaserInc : 0.0, R.pLaserMax);
+    }
+    if (R.pDriveMax > 0.0)
+        add("drive: peak pressure = %.3g dyn/cm^2 (%.1f Mbar), work = %.4g erg",
+            R.pDriveMax, R.pDriveMax / 1e12, driveWork);
+
+    if (deck_.control.geometry == 3) {
+        add("implosion:");
+        add("  peak implosion speed  = %.1f km/s at %.4g s (fuel mass-avg)",
+            R.vImp / 1e5, R.tVImp);
+        if (R.adiabat > 0.0)
+            add("  fuel adiabat then     = %.2f (mass-avg P/P_Fermi, dense shell)",
+                R.adiabat);
+        if (R.ifar > 0.0)
+            add("  IFAR (at 2/3 R0)      = %.1f at %.4g s", R.ifar, R.tIfar);
+        add("  convergence ratio     = %.1f (hot-spot boundary %.4g -> %.4g cm)",
+            (R.rIfMin > 0.0) ? rIf0_ / R.rIfMin : -1.0, rIf0_, R.rIfMin);
+        add("  bang time (peak fuel rhoR) = %.4g s", R.tBang);
+        add("  peak fuel rhoR        = %.3g g/cm^2 (total rhoR then: %.3g)",
+            R.rhoRFuel, R.rhoRTotAtBang);
+        add("  hot spot at bang: R = %.1f um, <Ti> = %.3g eV, <Te> = %.3g eV",
+            R.hsR * 1e4, R.hsTi, R.hsTe);
+        add("                    <P> = %.3g dyn/cm^2 (%.2f Gbar), rhoR = %.3g g/cm^2",
+            R.hsP, R.hsP / 1e15, R.hsRhoR);
+    }
+    add("extrema: rho_max = %.4g g/cc, Ti_max = %.4g eV, Te_max = %.4g eV, "
+        "E_kin_max = %.4g erg", R.rhoMax, R.TiMax, R.TeMax, R.EkinMax);
+    add("energy bookkeeping: floors injected %.3g erg, radiation leaked %.3g erg",
+        Efloor, Eleak);
+    add("===================================================");
+
+    std::cout << txt;
+    std::ofstream out(std::filesystem::path(deck_.output.directory) / "report.txt");
+    out << txt;
 }
 
 void Simulation::run() {
@@ -863,6 +1055,7 @@ void Simulation::run() {
         t += dt_;
         ++step;
 
+        updateReport();
         if (step % deck_.output.history_stride == 0) writeHistoryRow();
         if (t >= nextDump - 1e-30) {
             writeSnapshot(snapIndex++);
@@ -875,6 +1068,7 @@ void Simulation::run() {
 
     writeHistoryRow();
     writeSnapshot(snapIndex);
+    writeReport();
     std::cout << "hydro1d: done. t = " << t << " s in " << step << " steps. Output in "
               << deck_.output.directory << "/\n";
 }

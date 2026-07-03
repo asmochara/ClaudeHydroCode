@@ -33,6 +33,7 @@ dt_dump        = 0.5e-9
 history_stride = 50
 
 [material dt_gas]
+fuel          = true
 eos           = ideal
 gamma         = 1.6666667
 A             = 2.5
@@ -41,6 +42,7 @@ ionization    = tf
 opacity_table = examples/dt.opac
 
 [material dt_ice]
+fuel          = true
 eos           = ideal
 gamma         = 1.6666667
 A             = 2.5
