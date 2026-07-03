@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 
@@ -45,6 +46,7 @@ Simulation::Simulation(const InputDeck& deck) : deck_(deck) {
         // n_crit = pi me c^2 / (e^2 lambda^2) = 1.11485e21 / lambda_um^2 cm^-3
         const double lu = deck_.laser.wavelength_um;
         ncrit_ = 1.11485e21 / (lu * lu);
+        buildRaySet();
     }
 
     // Instantiate materials in a deterministic order and remember indices.
@@ -341,10 +343,63 @@ double Simulation::coulombLog(double ne, double Te_, double Z) const {
     return std::max(ll, 2.0);
 }
 
+// Equal-power ray impact parameters for the configured focal-spot profile:
+// each ray carries P/N when the b_k sit at the quantiles of the cumulative
+// power distribution C(b) = integral of 2*pi*b'*I(b') db'.
+void Simulation::buildRaySet() {
+    const auto& L = deck_.laser;
+    const int N = L.rays;
+    rayB_.resize(N);
+
+    if (L.profile == "flattop") {
+        // C(b) ~ b^2: quantiles in closed form.
+        for (int k = 0; k < N; ++k)
+            rayB_[k] = L.beam_radius * std::sqrt((k + 0.5) / N);
+        return;
+    }
+
+    // Radial intensity profile I(b) (relative units) and its outer edge.
+    double bmax;
+    std::function<double(double)> I;
+    if (L.profile == "table") {
+        const auto& tab = L.profile_table;
+        bmax = tab.back().first;
+        I = [&tab](double b) {
+            if (b < tab.front().first || b > tab.back().first) return 0.0;
+            return interpTimeTable(tab, b);
+        };
+    } else {  // gaussian | supergaussian, truncated at I/I0 = 1e-4
+        const double n = (L.profile == "gaussian") ? 2.0 : L.sg_order;
+        const double w = L.beam_radius;
+        bmax = w * std::pow(std::log(1e4), 1.0 / n);
+        I = [n, w](double b) { return std::exp(-std::pow(b / w, n)); };
+    }
+
+    // Cumulative power on a fine grid (trapezoid), then invert quantiles.
+    const int NG = 8192;
+    std::vector<double> bg(NG + 1), C(NG + 1);
+    for (int i = 0; i <= NG; ++i) bg[i] = bmax * i / NG;
+    C[0] = 0.0;
+    for (int i = 1; i <= NG; ++i) {
+        const double f0 = bg[i - 1] * I(bg[i - 1]);
+        const double f1 = bg[i] * I(bg[i]);
+        C[i] = C[i - 1] + 0.5 * (f0 + f1) * (bg[i] - bg[i - 1]);
+    }
+    if (C[NG] <= 0.0)
+        throw std::runtime_error("laser: focal-spot profile carries no power");
+    for (int k = 0; k < N; ++k) {
+        const double target = (k + 0.5) / N * C[NG];
+        const auto it = std::lower_bound(C.begin(), C.end(), target);
+        const size_t i = std::max<size_t>(1, it - C.begin());
+        const double wgt = (target - C[i - 1]) / std::max(C[i] - C[i - 1], 1e-300);
+        rayB_[k] = bg[i - 1] + wgt * (bg[i] - bg[i - 1]);
+    }
+}
+
 // Spherically symmetric laser ray trace with refraction. Uniform ("infinite
 // beam") illumination reduces, in 1D, to a bundle of rays sampling the focal
-// spot's impact parameter b in [0, beam_radius]: a flat-top spot gives equal
-// ray powers for b uniform in b^2. Each ray obeys Bouguer's law
+// spot's impact parameter b, distributed per the spot's radial intensity
+// profile (see buildRaySet). Each ray obeys Bouguer's law
 // mu(r) r sin(theta) = b in the spherically stratified plasma, so within a
 // zone of constant refractive index mu_j = sqrt(1 - ne/nc) it is a straight
 // chord with distance of closest approach d = b/mu_j. Rays refract, turn at
@@ -394,7 +449,7 @@ void Simulation::laserStep(double dt) {
     struct Seg { int zone; double len; };
     std::vector<Seg> segs;
     for (int k = 0; k < N; ++k) {
-        const double b = L.beam_radius * std::sqrt((k + 0.5) / N);
+        const double b = rayB_[k];
         if (b >= r[M]) {  // misses the plasma entirely
             rayDiag_.push_back({b, b, 0.0});
             continue;

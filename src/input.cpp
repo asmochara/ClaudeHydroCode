@@ -174,7 +174,10 @@ InputDeck parseDeck(const std::string& path) {
             auto& L = deck.laser;
             if      (key == "enabled")        L.enabled = toBool(val, key);
             else if (key == "wavelength_um")  L.wavelength_um = toDouble(val, key);
+            else if (key == "profile")        L.profile = val;
             else if (key == "beam_radius")    L.beam_radius = toDouble(val, key);
+            else if (key == "sg_order")       L.sg_order = toDouble(val, key);
+            else if (key == "profile_table")  parseTimeTable(val, key, L.profile_table, fail);
             else if (key == "rays")           L.rays = toInt(val, key);
             else if (key == "absorb_at_critical") L.absorb_at_critical = toDouble(val, key);
             else if (key == "power")          parseTimeTable(val, key, L.power, fail);
@@ -263,8 +266,28 @@ InputDeck parseDeck(const std::string& path) {
         const auto& L = deck.laser;
         if (L.wavelength_um <= 0.0)
             throw std::runtime_error("input: laser.wavelength_um must be > 0");
-        if (L.beam_radius <= 0.0)
+        if (L.profile != "flattop" && L.profile != "gaussian" &&
+            L.profile != "supergaussian" && L.profile != "table")
+            throw std::runtime_error(
+                "input: laser.profile must be flattop|gaussian|supergaussian|table");
+        if (L.profile == "table") {
+            if (L.profile_table.size() < 2)
+                throw std::runtime_error("input: laser profile = table needs a "
+                                         "'profile_table = r0 I0 r1 I1 ...' with >= 2 points");
+            double sum = 0.0;
+            for (const auto& [rb, Ib] : L.profile_table) {
+                if (rb < 0.0 || Ib < 0.0)
+                    throw std::runtime_error(
+                        "input: laser profile_table radii and intensities must be >= 0");
+                sum += Ib * (rb + 1e-30);
+            }
+            if (sum <= 0.0)
+                throw std::runtime_error("input: laser profile_table carries no power");
+        } else if (L.beam_radius <= 0.0) {
             throw std::runtime_error("input: laser needs beam_radius > 0 [cm]");
+        }
+        if (L.profile == "supergaussian" && L.sg_order <= 0.0)
+            throw std::runtime_error("input: laser.sg_order must be > 0");
         if (L.rays < 1)
             throw std::runtime_error("input: laser.rays must be >= 1");
         if (L.power.empty())

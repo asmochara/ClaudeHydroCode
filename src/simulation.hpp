@@ -35,6 +35,7 @@ private:
     void setupMesh();
     double computeDt() const;
     void hydroStep(double dt);
+    void buildRaySet();              // equal-power impact parameters from profile
     void laserStep(double dt);       // ray-traced deposition (dt=0: trace only)
     void couplingStep(double dt);    // electron-ion temperature relaxation (2T)
     void conductionStep(double dt);  // electron (+ ion, in 2T) conduction
@@ -59,6 +60,7 @@ private:
     bool rad_ = false;
     bool laser_ = false;
     double ncrit_ = 0.0;          // critical electron density [1/cm^3]
+    std::vector<double> rayB_;    // equal-power ray impact parameters [cm]
 
     int M = 0;                    // number of zones (M+1 nodes)
     // Node-centered:

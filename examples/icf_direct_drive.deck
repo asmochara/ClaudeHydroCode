@@ -30,7 +30,11 @@ bc_outer = vacuum
 [laser]
 enabled            = true
 wavelength_um      = 0.351
-beam_radius        = 0.104    # matches the initial target radius
+profile            = flattop  # flattop | gaussian | supergaussian | table
+beam_radius        = 0.104    # flattop edge (or 1/e-intensity radius for
+                              # gaussian/supergaussian), here = target radius
+#sg_order          = 4        # super-Gaussian exponent (profile = supergaussian)
+#profile_table     = 0.0 1.0  0.08 1.0  0.12 0.0   # radius [cm], rel. intensity
 rays               = 48
 absorb_at_critical = 0.1
 # time [s], total power on target from all beams [erg/s] (1 TW = 1e19 erg/s)

@@ -84,13 +84,26 @@ struct DriveSpec {
 
 struct LaserSpec {
     // Spherically symmetric laser illumination ("infinitely many beams"):
-    // rays sample the focal spot's impact parameters b in [0, beam_radius]
-    // (flat-top spot, equal-power rays uniform in b^2) and are traced with
-    // refraction through the corona; inverse-bremsstrahlung absorption along
-    // the path, reflection at the turning point / critical surface.
+    // rays sample the focal spot's impact parameter b, weighted by the
+    // spot's radial intensity profile (equal-power rays at the quantiles of
+    // the cumulative power distribution), and are traced with refraction
+    // through the corona; inverse-bremsstrahlung absorption along the path,
+    // reflection at the turning point / critical surface.
     bool enabled = false;
     double wavelength_um = 0.351;   // laser wavelength [microns]
+    // Focal-spot radial intensity profile:
+    //   flattop:              uniform for b < beam_radius, sharp edge
+    //   gaussian:             I ~ exp(-(b/beam_radius)^2)
+    //   supergaussian:        I ~ exp(-(b/beam_radius)^sg_order)
+    //   table:                piecewise-linear profile_table, zero outside
+    // For (super)gaussian spots beam_radius is the 1/e-intensity radius and
+    // the profile is truncated where I falls to 1e-4 of peak.
+    std::string profile = "flattop";
     double beam_radius = -1.0;      // focal-spot radius [cm]
+    double sg_order = 4.0;          // super-Gaussian exponent
+    // (radius [cm], relative intensity) pairs for profile = table; radii
+    // ascending. A first radius > 0 gives an annular beam.
+    std::vector<std::pair<double, double>> profile_table;
     int rays = 64;                  // impact-parameter samples
     double absorb_at_critical = 0.1;  // fraction of remaining ray power dumped
                                       // at the critical surface (resonance-

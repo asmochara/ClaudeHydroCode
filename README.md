@@ -71,8 +71,14 @@ inertial-confinement-fusion capsule implosions driven by an applied
   tracked in the energy budget).
 - **Laser ray tracing:** spherically symmetric direct-drive illumination
   (`[laser]`). Uniform "infinitely many beams" illumination reduces in 1D
-  to a bundle of rays sampling the focal spot's impact parameter
-  b ∈ [0, `beam_radius`] (flat-top spot → equal-power rays uniform in b²).
+  to a bundle of rays sampling the focal spot's impact parameter b,
+  distributed according to the spot's radial intensity profile: `profile =
+  flattop` (sharp edge at `beam_radius`), `gaussian` / `supergaussian`
+  (I ∝ exp(−(b/`beam_radius`)^`sg_order`) with `beam_radius` the
+  1/e-intensity radius, truncated at 1e-4 of peak), or `table` (arbitrary
+  piecewise-linear radius/intensity pairs — a first radius > 0 gives an
+  annular beam). Rays carry equal power by sampling the quantiles of the
+  profile's cumulative power distribution.
   Each ray obeys Bouguer's law `mu r sin(theta) = b` in the spherically
   stratified plasma with `mu = sqrt(1 - ne/n_crit)`,
   `n_crit = 1.115e21/lambda_um^2`, so rays refract through the corona,
@@ -179,7 +185,7 @@ See the examples for complete decks.
 | `[conduction]` | `enabled`, `flux_limiter`, `ln_lambda` (number or `auto`), `ion_conduction` (2T, default true), `ion_flux_limiter` |
 | `[radiation]` | `enabled`, `bc_outer` (insulated/vacuum) |
 | `[drive]` | `table = t0 p0 t1 p1 ...` (s, dyn/cm^2), linearly interpolated, end values held |
-| `[laser]` | `enabled`, `wavelength_um`, `beam_radius` (cm), `rays`, `absorb_at_critical` (0–1), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
+| `[laser]` | `enabled`, `wavelength_um`, `profile` (flattop/gaussian/supergaussian/table), `beam_radius` (cm), `sg_order`, `profile_table = r0 I0 r1 I1 ...` (cm, relative intensity), `rays`, `absorb_at_critical` (0–1), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
 | `[output]` | `directory`, `dt_dump` (s), `history_stride` |
 | `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
 | `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), optional `Ti0`/`Te0` (2T), `Tr0` (radiation), `ratio` (outer/inner zone-width ratio) |
