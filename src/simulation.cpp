@@ -40,6 +40,12 @@ void thomasSolve(std::vector<double>& a, std::vector<double>& b,
 Simulation::Simulation(const InputDeck& deck) : deck_(deck) {
     twoT_ = (deck_.control.temperatures == 2);
     rad_ = deck_.radiation.enabled;
+    laser_ = deck_.laser.enabled;
+    if (laser_) {
+        // n_crit = pi me c^2 / (e^2 lambda^2) = 1.11485e21 / lambda_um^2 cm^-3
+        const double lu = deck_.laser.wavelength_um;
+        ncrit_ = 1.11485e21 / (lu * lu);
+    }
 
     // Instantiate materials in a deterministic order and remember indices.
     for (const auto& [name, spec] : deck_.materials) {
@@ -260,11 +266,11 @@ void Simulation::hydroStep(double dt) {
         const double f = -(P[i] + radP(i) + q[i] - P[i - 1] - radP(i - 1) - q[i - 1]);
         u[i] += dt * area(r[i]) * f / dmNode[i];
     }
-    if (c.bc_outer == "pressure") {
-        const double pd = deck_.drive.pressure(t);
+    if (c.bc_outer == "pressure" || c.bc_outer == "free") {
+        const double pd = (c.bc_outer == "pressure") ? deck_.drive.pressure(t) : 0.0;
         u[M] += dt * area(r[M]) * (P[M - 1] + radP(M - 1) + q[M - 1] - pd) / dmNode[M];
         // Work done on the system by the applied pressure.
-        driveWork += -pd * area(r[M]) * u[M] * dt;
+        if (pd != 0.0) driveWork += -pd * area(r[M]) * u[M] * dt;
     }  // else wall: u[M] stays 0
 
     // --- move nodes -------------------------------------------------------
@@ -333,6 +339,148 @@ double Simulation::coulombLog(double ne, double Te_, double Z) const {
     else
         ll = 23.0 - std::log(std::sqrt(ne) * Z * std::pow(Te_, -1.5));
     return std::max(ll, 2.0);
+}
+
+// Spherically symmetric laser ray trace with refraction. Uniform ("infinite
+// beam") illumination reduces, in 1D, to a bundle of rays sampling the focal
+// spot's impact parameter b in [0, beam_radius]: a flat-top spot gives equal
+// ray powers for b uniform in b^2. Each ray obeys Bouguer's law
+// mu(r) r sin(theta) = b in the spherically stratified plasma, so within a
+// zone of constant refractive index mu_j = sqrt(1 - ne/nc) it is a straight
+// chord with distance of closest approach d = b/mu_j. Rays refract, turn at
+// d (or reflect at the critical surface / a total-internal-reflection
+// interface), and retrace the mirrored path outward. Inverse-bremsstrahlung
+// absorption attenuates the ray along each chord and the loss is deposited
+// in the traversed zone (into the electrons in 2T mode). A user-set fraction
+// of the power reaching the critical surface is dumped there as a
+// resonance-absorption stand-in.
+void Simulation::laserStep(double dt) {
+    if (!laser_) return;
+    const auto& L = deck_.laser;
+    const double Pt = L.powerAt(t);
+    fabs_ = 0.0;
+    rayDiag_.clear();
+    if (Pt <= 0.0) return;
+
+    // Zone optics from the beginning-of-step state.
+    std::vector<double> mu(M), kap(M);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int k = 0; k < M; ++k) {
+        const auto& m = mats_[matid[k]];
+        const double Tel = twoT_ ? Te[k] : T[k];
+        const double ne = rho[k] * zb[k] / (m.A * phys::m_p);
+        const double x = ne / ncrit_;
+        if (x < 1.0) {
+            mu[k] = std::sqrt(1.0 - x);
+            // Inverse bremsstrahlung: kappa = nu_ei (ne/nc) / (c mu), with the
+            // NRL electron-ion collision frequency.
+            const double Zeff = std::max(zb[k], 1.0);
+            const double lnL = coulombLog(ne, Tel, Zeff);
+            const double nu = 2.91e-6 * Zeff * ne * lnL / std::pow(Tel, 1.5);
+            kap[k] = nu * x / (phys::c_light * mu[k]);
+        } else {
+            mu[k] = 0.0;   // overdense: reflects at this zone's outer face
+            kap[k] = 0.0;
+        }
+    }
+
+    std::vector<double> dep(M, 0.0);
+    double absorbed = 0.0;
+    const int N = L.rays;
+    const double Pray = Pt / N;
+
+    struct Seg { int zone; double len; };
+    std::vector<Seg> segs;
+    for (int k = 0; k < N; ++k) {
+        const double b = L.beam_radius * std::sqrt((k + 0.5) / N);
+        if (b >= r[M]) {  // misses the plasma entirely
+            rayDiag_.push_back({b, b, 0.0});
+            continue;
+        }
+        // Inward walk from the outer boundary.
+        segs.clear();
+        bool turnedInShell = false;
+        int critZone = -1;
+        double rmin = r[0];
+        for (int j = M - 1; j >= 0; --j) {
+            const double rin = r[j], rout = r[j + 1];
+            if (mu[j] <= 0.0) {           // critical surface at this face
+                critZone = j;
+                rmin = rout;
+                break;
+            }
+            const double d = b / mu[j];   // chord's closest approach
+            if (d >= rout) {              // total internal reflection at face
+                rmin = rout;
+                break;
+            }
+            const double souter = std::sqrt(rout * rout - d * d);
+            if (d >= rin) {               // turns inside this shell
+                segs.push_back({j, 2.0 * souter});
+                rmin = d;
+                turnedInShell = true;
+                break;
+            }
+            segs.push_back({j, souter - std::sqrt(rin * rin - d * d)});
+            // j == 0 and no turn: ray reaches the inner wall (r_min > 0)
+            // and reflects; rmin = r[0] already set.
+        }
+
+        // Attenuate: inward chords, optional critical dump, mirrored outward
+        // chords (the turning chord already covers both directions).
+        double Prem = Pray;
+        for (const auto& s : segs) {
+            const double dP = Prem * (-std::expm1(-kap[s.zone] * s.len));
+            dep[s.zone] += dP;
+            Prem -= dP;
+        }
+        if (critZone >= 0 && L.absorb_at_critical > 0.0) {
+            const double dP = Prem * L.absorb_at_critical;
+            dep[critZone] += dP;
+            Prem -= dP;
+        }
+        const int nOut = static_cast<int>(segs.size()) - (turnedInShell ? 1 : 0);
+        for (int s = nOut - 1; s >= 0; --s) {
+            const double dP = Prem * (-std::expm1(-kap[segs[s].zone] * segs[s].len));
+            dep[segs[s].zone] += dP;
+            Prem -= dP;
+        }
+        absorbed += Pray - Prem;  // remainder escapes back out
+        rayDiag_.push_back({b, rmin, (Pray - Prem) / Pray});
+    }
+
+    fabs_ = absorbed / Pt;
+    if (dt <= 0.0) return;  // trace-only mode (rayTraceReport)
+    Elaser += absorbed * dt;
+
+    // Deposit into the electron (or 1T matter) energy.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int k = 0; k < M; ++k) {
+        if (dep[k] <= 0.0) continue;
+        const auto& m = mats_[matid[k]];
+        const double de = dep[k] * dt / dm[k];
+        if (twoT_) {
+            ee[k] += de;
+            Te[k] = m.ele->temperature(rho[k], ee[k], Te[k]);
+        } else {
+            e[k] += de;
+            T[k] = m.eos->temperature(rho[k], e[k], T[k]);
+        }
+    }
+}
+
+void Simulation::rayTraceReport() {
+    laserStep(0.0);
+    std::printf("# ray trace at t = %g s, P = %g erg/s, n_crit = %g cm^-3\n",
+                t, deck_.laser.powerAt(t), ncrit_);
+    std::printf("# %12s %14s %14s\n", "b [cm]", "r_turn [cm]", "f_abs");
+    for (const auto& ri : rayDiag_)
+        std::printf("  %12.6e %14.6e %14.6e\n", ri.b, ri.rmin, ri.fabs);
+    std::printf("# total absorbed fraction = %.6f\n", fabs_);
 }
 
 void Simulation::couplingStep(double dt) {
@@ -593,8 +741,8 @@ void Simulation::writeSnapshot(int index) const {
 void Simulation::writeHistoryHeader() {
     histPath_ = (std::filesystem::path(deck_.output.directory) / "history.csv").string();
     std::ofstream out(histPath_);
-    out << "step,t,dt,r_outer,u_outer,p_drive,rho_max,Ti_max,Te_max,Te_center,"
-           "rhoR,E_int,E_kin,E_rad,W_drive,E_leak,E_err\n";
+    out << "step,t,dt,r_outer,u_outer,p_drive,P_laser,f_abs,rho_max,Ti_max,"
+           "Te_max,Te_center,rhoR,E_int,E_kin,E_rad,W_drive,E_laser,E_leak,E_err\n";
 }
 
 void Simulation::writeHistoryRow() {
@@ -610,16 +758,19 @@ void Simulation::writeHistoryRow() {
     }
     for (int i = 0; i <= M; ++i) Ekin += 0.5 * dmNode[i] * u[i] * u[i];
     const double Etot = Eint + Ekin + Erad;
-    const double scale = std::max({std::abs(Etot), std::abs(driveWork), std::abs(E0), 1e-300});
-    const double err = (Etot - E0 - driveWork + Eleak) / scale;
+    const double scale = std::max({std::abs(Etot), std::abs(driveWork),
+                                   std::abs(Elaser), std::abs(E0), 1e-300});
+    const double err = (Etot - E0 - driveWork - Elaser + Eleak) / scale;
 
     std::ofstream out(histPath_, std::ios::app);
     out.precision(9);
     out << step << ',' << t << ',' << dt_ << ',' << r[M] << ',' << u[M] << ','
-        << deck_.drive.pressure(t) << ',' << rhomax << ',' << Timax << ','
+        << deck_.drive.pressure(t) << ','
+        << (laser_ ? deck_.laser.powerAt(t) : 0.0) << ',' << fabs_ << ','
+        << rhomax << ',' << Timax << ','
         << Temax << ',' << (twoT_ ? Te[0] : T[0]) << ',' << rhoR << ','
         << Eint << ',' << Ekin << ',' << Erad << ',' << driveWork << ','
-        << Eleak << ',' << err << '\n';
+        << Elaser << ',' << Eleak << ',' << err << '\n';
 }
 
 void Simulation::run() {
@@ -635,15 +786,17 @@ void Simulation::run() {
               << ", " << (twoT_ ? "2T" : "1T")
               << ", conduction " << (deck_.conduction.enabled ? "on" : "off")
               << ", radiation " << (rad_ ? "on" : "off")
+              << ", laser " << (laser_ ? "on" : "off")
               << ", outer BC " << deck_.control.bc_outer << "\n";
 
-    const bool refresh = deck_.conduction.enabled || twoT_ || rad_;
+    const bool refresh = deck_.conduction.enabled || twoT_ || rad_ || laser_;
     dt_ = deck_.control.dt_init;
     while (t < deck_.control.t_end && step < deck_.control.max_steps) {
         dt_ = std::min(computeDt(), deck_.control.t_end - t);
         if (step == 0) dt_ = std::min(dt_, deck_.control.dt_init);
 
         hydroStep(dt_);
+        laserStep(dt_);
         couplingStep(dt_);
         conductionStep(dt_);
         radiationStep(dt_);

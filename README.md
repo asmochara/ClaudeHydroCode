@@ -69,17 +69,40 @@ inertial-confinement-fusion capsule implosions driven by an applied
   (https://aphysics2.lanl.gov/apps/), reduced to grey means.
   `radiation.bc_outer` is `insulated` or `vacuum` (Marshak leakage,
   tracked in the energy budget).
-- **Pressure drive:** a piecewise-linear-in-time applied pressure at the
-  outer boundary (`[drive]` table + `bc_outer = pressure`) stands in for
-  the ablation pressure that starts the confinement. The cumulative drive
-  work is tracked and an energy-conservation error is reported in the
-  history file.
+- **Laser ray tracing:** spherically symmetric direct-drive illumination
+  (`[laser]`). Uniform "infinitely many beams" illumination reduces in 1D
+  to a bundle of rays sampling the focal spot's impact parameter
+  b ∈ [0, `beam_radius`] (flat-top spot → equal-power rays uniform in b²).
+  Each ray obeys Bouguer's law `mu r sin(theta) = b` in the spherically
+  stratified plasma with `mu = sqrt(1 - ne/n_crit)`,
+  `n_crit = 1.115e21/lambda_um^2`, so rays refract through the corona,
+  turn at their Bouguer radius (or reflect at the critical surface / a
+  total-internal-reflection interface), and retrace the mirrored path
+  outward. Inverse-bremsstrahlung absorption
+  (`kappa = nu_ei (ne/nc) / (c mu)`, NRL collision frequency) attenuates
+  each chord and deposits into the electrons; a user-set fraction of the
+  power reaching the critical surface is dumped there
+  (`absorb_at_critical`, a resonance-absorption stand-in that also
+  bootstraps absorption before a corona exists). Inputs: total power vs
+  time on target (all beams summed), wavelength, beam radius, ray count.
+  Unabsorbed light escapes; absorbed/incident power bookkeeping is exact
+  and reported in the history. Use `bc_outer = free` so the corona can
+  blow off and the ablation pressure emerges self-consistently — this
+  replaces the prescribed pressure drive.
+  (`hydro1d --raytrace DECK` prints per-ray turning radii and absorbed
+  fractions for the initial state.)
+- **Pressure drive (alternative):** a piecewise-linear-in-time applied
+  pressure at the outer boundary (`[drive]` table + `bc_outer = pressure`)
+  stands in for the ablation pressure when you don't want to model the
+  laser. The cumulative drive work is tracked and an energy-conservation
+  error is reported in the history file.
 - **Units:** CGS everywhere, temperatures in eV
   (1 Mbar = 1e12 dyn/cm^2).
 
-Not included (yet): DT burn/alpha heating, multigroup radiation, ablation
-physics/laser deposition, electron degeneracy in the ideal EOS (use tables
-for degenerate/cold-matter regimes).
+Not included (yet): DT burn/alpha heating, multigroup radiation,
+laser-plasma instabilities (the ray trace covers only refraction, inverse
+bremsstrahlung, and a critical-surface dump), electron degeneracy in the
+ideal EOS (use tables for degenerate/cold-matter regimes).
 
 ## Building
 
@@ -125,6 +148,19 @@ Example decks (all runtimes seconds on one core):
   2T signatures: shocked ions run hotter than electrons in flight, a
   brief multi-keV ion flash at void closure smoothed by ion conduction,
   and a hot spot cooled by radiating into the optically thick fuel.
+- `examples/raytrace_test.deck` — ray-tracing verification (run with
+  `--raytrace`): a uniform sphere with refractive index 0.6; the reported
+  turning radii match Bouguer's law (r_turn = b/0.6, total external
+  reflection for b > 0.6R) to machine precision.
+- `examples/icf_direct_drive.deck` — the same capsule driven by the laser
+  instead of an applied pressure (351 nm, ~60 TW peak, `bc_outer = free`).
+  Absorption bootstraps from the critical-surface dump on cold solid to
+  ~65% inverse bremsstrahlung once the corona forms, then falls as the
+  expanding corona refracts rays away from the shrinking target — all
+  resolved by the ray trace. The un-optimized pulse plus radiative preheat
+  from the crude demo opacities give a modest but complete implosion
+  (~155 km/s shell, convergence ratio ~26, ~50 g/cc fuel, ~1.5 keV hot
+  spot); pulse-shape and opacity fidelity are left to the user.
 
 Quick-look plotting (requires matplotlib + pandas):
 
@@ -139,10 +175,11 @@ See the examples for complete decks.
 
 | Section | Keys |
 |---|---|
-| `[control]` | `t_end`, `dt_init`, `dt_max`, `cfl`, `dt_growth`, `max_steps`, `geometry` (planar/cylindrical/spherical), `temperatures` (1/2), `r_min`, `bc_outer` (wall/pressure), `c_quad`, `c_lin`, `T_floor` [eV] |
+| `[control]` | `t_end`, `dt_init`, `dt_max`, `cfl`, `dt_growth`, `max_steps`, `geometry` (planar/cylindrical/spherical), `temperatures` (1/2), `r_min`, `bc_outer` (wall/pressure/free), `c_quad`, `c_lin`, `T_floor` [eV] |
 | `[conduction]` | `enabled`, `flux_limiter`, `ln_lambda` (number or `auto`), `ion_conduction` (2T, default true), `ion_flux_limiter` |
 | `[radiation]` | `enabled`, `bc_outer` (insulated/vacuum) |
 | `[drive]` | `table = t0 p0 t1 p1 ...` (s, dyn/cm^2), linearly interpolated, end values held |
+| `[laser]` | `enabled`, `wavelength_um`, `beam_radius` (cm), `rays`, `absorb_at_critical` (0–1), `power = t0 P0 t1 P1 ...` (s, erg/s; total on target, 1 TW = 1e19 erg/s) |
 | `[output]` | `directory`, `dt_dump` (s), `history_stride` |
 | `[material NAME]` | `eos` (ideal/table), `gamma`, `A` (amu), `Z` (nuclear charge; the fixed Zbar when `ionization = fixed`), `table` (1T EOS file), `table_ion`/`table_electron` (2T EOS files), `ionization` (fixed/tf/table), `zbar_table`, `opacity_table` **or** `kappa_R` + `kappa_P` (cm^2/g) |
 | `[layer]` (repeatable, innermost first) | `material`, `thickness` (cm), `zones`, `rho0` (g/cc), `T0` (eV) **or** `P0` (dyn/cm^2), optional `Ti0`/`Te0` (2T), `Tr0` (radiation), `ratio` (outer/inner zone-width ratio) |
@@ -178,11 +215,12 @@ documents the intended OPLIB/TOPS workflow.
   pressure, specific internal energy, sound speed, artificial viscosity,
   material.
 - `history.csv` — per-step time series: outer radius/velocity, drive
-  pressure, max density, max ion/electron temperature, central electron
-  temperature, rhoR, internal/kinetic/radiation energy, cumulative drive
-  work, radiation leaked through the boundary, and the relative
-  energy-conservation error
-  `E_err = (E_int + E_kin + E_rad - E_0 - W_drive + E_leak)/E`.
+  pressure, laser power and instantaneous absorbed fraction, max density,
+  max ion/electron temperature, central electron temperature, rhoR,
+  internal/kinetic/radiation energy, cumulative drive work, cumulative
+  absorbed laser energy, radiation leaked through the boundary, and the
+  relative energy-conservation error
+  `E_err = (E_int + E_kin + E_rad - E_0 - W_drive - E_laser + E_leak)/E`.
 
 ## Parallelism and design notes
 
@@ -206,4 +244,5 @@ natural upgrades slot in without restructuring:
   of the built-in tridiagonal solves. The table readers are the
   attachment points for LEOS/SESAME EOS data and OPLIB/TOPS opacities.
 - **Obvious next physics steps:** DT burn with alpha heating, multigroup
-  radiation diffusion, and laser/ablation source models.
+  radiation diffusion, and refined laser coupling (Langdon effect,
+  resonance-absorption models, cross-beam energy transfer proxies).

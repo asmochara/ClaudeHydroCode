@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <stdexcept>
 
@@ -48,19 +49,34 @@ std::vector<double> toDoubleList(const std::string& s, const std::string& key) {
 
 }  // namespace
 
-double DriveSpec::pressure(double t) const {
-    if (table.empty()) return 0.0;
-    if (t <= table.front().first) return table.front().second;
-    if (t >= table.back().first) return table.back().second;
-    for (size_t k = 1; k < table.size(); ++k) {
-        if (t <= table[k].first) {
-            const auto& [t0, p0] = table[k - 1];
-            const auto& [t1, p1] = table[k];
-            return p0 + (p1 - p0) * (t - t0) / (t1 - t0);
+double interpTimeTable(const std::vector<std::pair<double, double>>& tab, double t) {
+    if (tab.empty()) return 0.0;
+    if (t <= tab.front().first) return tab.front().second;
+    if (t >= tab.back().first) return tab.back().second;
+    for (size_t k = 1; k < tab.size(); ++k) {
+        if (t <= tab[k].first) {
+            const auto& [t0, v0] = tab[k - 1];
+            const auto& [t1, v1] = tab[k];
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0);
         }
     }
-    return table.back().second;
+    return tab.back().second;
 }
+
+namespace {
+void parseTimeTable(const std::string& val, const std::string& key,
+                    std::vector<std::pair<double, double>>& out,
+                    const std::function<void(const std::string&)>& fail) {
+    auto nums = toDoubleList(val, key);
+    if (nums.empty() || nums.size() % 2 != 0)
+        fail(key + " table must be pairs: t0 v0 t1 v1 ...");
+    for (size_t k = 0; k + 1 < nums.size(); k += 2)
+        out.emplace_back(nums[k], nums[k + 1]);
+    for (size_t k = 1; k < out.size(); ++k)
+        if (out[k].first <= out[k - 1].first)
+            fail(key + " table times must be ascending");
+}
+}  // namespace
 
 InputDeck parseDeck(const std::string& path) {
     std::ifstream in(path);
@@ -99,7 +115,7 @@ InputDeck parseDeck(const std::string& path) {
                 deck.layers.emplace_back();
             } else if (section != "control" && section != "conduction" &&
                        section != "radiation" && section != "output" &&
-                       section != "drive") {
+                       section != "drive" && section != "laser") {
                 fail("unknown section [" + section + "]");
             }
             continue;
@@ -152,16 +168,17 @@ InputDeck parseDeck(const std::string& path) {
             else if (key == "history_stride") o.history_stride = toInt(val, key);
             else fail("unknown output key '" + key + "'");
         } else if (section == "drive") {
-            if (key == "table") {
-                auto nums = toDoubleList(val, key);
-                if (nums.empty() || nums.size() % 2 != 0)
-                    fail("drive table must be pairs: t0 p0 t1 p1 ...");
-                for (size_t k = 0; k + 1 < nums.size(); k += 2)
-                    deck.drive.table.emplace_back(nums[k], nums[k + 1]);
-                for (size_t k = 1; k < deck.drive.table.size(); ++k)
-                    if (deck.drive.table[k].first <= deck.drive.table[k - 1].first)
-                        fail("drive table times must be ascending");
-            } else fail("unknown drive key '" + key + "'");
+            if (key == "table") parseTimeTable(val, key, deck.drive.table, fail);
+            else fail("unknown drive key '" + key + "'");
+        } else if (section == "laser") {
+            auto& L = deck.laser;
+            if      (key == "enabled")        L.enabled = toBool(val, key);
+            else if (key == "wavelength_um")  L.wavelength_um = toDouble(val, key);
+            else if (key == "beam_radius")    L.beam_radius = toDouble(val, key);
+            else if (key == "rays")           L.rays = toInt(val, key);
+            else if (key == "absorb_at_critical") L.absorb_at_critical = toDouble(val, key);
+            else if (key == "power")          parseTimeTable(val, key, L.power, fail);
+            else fail("unknown laser key '" + key + "'");
         } else if (section == "material") {
             auto& m = deck.materials[sectionArg];
             if      (key == "eos")   m.eos = val;
@@ -235,12 +252,26 @@ InputDeck parseDeck(const std::string& path) {
             throw std::runtime_error(tag + "radiation is enabled; give 'opacity_table' "
                                      "or constant 'kappa_R' and 'kappa_P' [cm^2/g]");
     }
-    if (deck.control.bc_outer != "wall" && deck.control.bc_outer != "pressure")
-        throw std::runtime_error("input: control.bc_outer must be wall|pressure");
+    if (deck.control.bc_outer != "wall" && deck.control.bc_outer != "pressure" &&
+        deck.control.bc_outer != "free")
+        throw std::runtime_error("input: control.bc_outer must be wall|pressure|free");
     if (deck.control.bc_outer == "pressure" && deck.drive.empty())
         throw std::runtime_error("input: bc_outer = pressure requires a [drive] table");
     if (deck.radiation.bc_outer != "insulated" && deck.radiation.bc_outer != "vacuum")
         throw std::runtime_error("input: radiation.bc_outer must be insulated|vacuum");
+    if (deck.laser.enabled) {
+        const auto& L = deck.laser;
+        if (L.wavelength_um <= 0.0)
+            throw std::runtime_error("input: laser.wavelength_um must be > 0");
+        if (L.beam_radius <= 0.0)
+            throw std::runtime_error("input: laser needs beam_radius > 0 [cm]");
+        if (L.rays < 1)
+            throw std::runtime_error("input: laser.rays must be >= 1");
+        if (L.power.empty())
+            throw std::runtime_error("input: laser needs a 'power = t0 P0 ...' table [erg/s]");
+        if (L.absorb_at_critical < 0.0 || L.absorb_at_critical > 1.0)
+            throw std::runtime_error("input: laser.absorb_at_critical must be in [0,1]");
+    }
 
     return deck;
 }

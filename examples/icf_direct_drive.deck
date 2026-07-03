@@ -1,0 +1,88 @@
+# Direct-drive ICF capsule: the same DT-gas / DT-ice / CH target as the
+# other capsule decks, but driven by laser ray tracing instead of an applied
+# pressure. 351 nm light, total power vs time set below; rays refract
+# through the blowoff corona, absorb by inverse bremsstrahlung, and the
+# ablation pressure emerges self-consistently (bc_outer = free lets the
+# corona expand). Full physics stack: 2T, ion+electron conduction,
+# Thomas-Fermi ionization, radiation diffusion.
+# Generate the demo opacity tables first:
+#   python3 tools/make_test_opacity.py examples/dt.opac --Z 1   --A 2.5
+#   python3 tools/make_test_opacity.py examples/ch.opac --Z 3.5 --A 6.51
+
+[control]
+geometry     = spherical
+temperatures = 2
+t_end        = 16e-9
+dt_init      = 1e-14
+cfl          = 0.35
+bc_outer     = free
+T_floor      = 0.01
+
+[conduction]
+enabled      = true
+flux_limiter = 0.06
+ln_lambda    = auto
+
+[radiation]
+enabled  = true
+bc_outer = vacuum
+
+[laser]
+enabled            = true
+wavelength_um      = 0.351
+beam_radius        = 0.104    # matches the initial target radius
+rays               = 48
+absorb_at_critical = 0.1
+# time [s], total power on target from all beams [erg/s] (1 TW = 1e19 erg/s)
+power = 0.0 2e19   1.5e-9 2e19   4.5e-9 6e20   10e-9 6e20   10.5e-9 0.0
+
+[output]
+directory      = out_icf_dd
+dt_dump        = 0.5e-9
+history_stride = 50
+
+[material dt_gas]
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material dt_ice]
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material ch]
+eos           = ideal
+gamma         = 1.6666667
+A             = 6.51
+Z             = 3.5
+ionization    = tf
+opacity_table = examples/ch.opac
+
+[layer]
+material  = dt_gas
+thickness = 0.085
+zones     = 120
+rho0      = 5e-4
+T0        = 0.025
+
+[layer]
+material  = dt_ice
+thickness = 0.007
+zones     = 100
+rho0      = 0.25
+T0        = 0.025
+
+[layer]
+material  = ch
+thickness = 0.012
+zones     = 80
+rho0      = 1.05
+T0        = 0.025
+ratio     = 0.3       # feather zones finer toward the ablation surface

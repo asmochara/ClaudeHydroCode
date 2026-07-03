@@ -23,6 +23,9 @@ class Simulation {
 public:
     explicit Simulation(const InputDeck& deck);
     void run();
+    // Trace the laser through the initial state and print per-ray
+    // diagnostics (impact parameter, turning radius, absorbed fraction).
+    void rayTraceReport();
 
 private:
     // Geometry helpers (d = 1, 2, 3).
@@ -32,6 +35,7 @@ private:
     void setupMesh();
     double computeDt() const;
     void hydroStep(double dt);
+    void laserStep(double dt);       // ray-traced deposition (dt=0: trace only)
     void couplingStep(double dt);    // electron-ion temperature relaxation (2T)
     void conductionStep(double dt);  // electron (+ ion, in 2T) conduction
     void solveConduction(double dt, bool ion);
@@ -53,6 +57,8 @@ private:
     std::vector<Material> mats_;
     bool twoT_ = false;
     bool rad_ = false;
+    bool laser_ = false;
+    double ncrit_ = 0.0;          // critical electron density [1/cm^3]
 
     int M = 0;                    // number of zones (M+1 nodes)
     // Node-centered:
@@ -73,6 +79,11 @@ private:
     long step = 0;
     double driveWork = 0.0;       // cumulative boundary work done on the system
     double Eleak = 0.0;           // cumulative radiation lost through boundary
+    double Elaser = 0.0;          // cumulative laser energy absorbed
+    double fabs_ = 0.0;           // instantaneous absorbed laser fraction
     double E0 = 0.0;              // initial total energy
     std::string histPath_;
+
+    struct RayInfo { double b, rmin, fabs; };
+    std::vector<RayInfo> rayDiag_;  // per-ray diagnostics from last laserStep
 };

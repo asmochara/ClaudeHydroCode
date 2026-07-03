@@ -1,0 +1,44 @@
+# Ray-tracing refraction verification, run with:
+#   ./build/hydro1d --raytrace examples/raytrace_test.deck
+# A uniform DT sphere (R = 0.1 cm) at ne/nc = 0.64 for 351 nm light, i.e.
+# a uniform refractive index mu = 0.6. Bouguer's law gives the analytic
+# turning radius of a ray with impact parameter b:
+#   r_turn = b/0.6        for b <  0.6*R  (turns inside the sphere)
+#   r_turn = R (reflects)  for b >= 0.6*R  (total external reflection)
+# The reported r_turn column must match this exactly; absorption is strong
+# at these conditions, so rays that penetrate report f_abs ~ 1.
+
+[control]
+geometry     = spherical
+temperatures = 2
+t_end        = 1e-12
+bc_outer     = free
+T_floor      = 0.01
+
+[conduction]
+enabled = false
+
+[laser]
+enabled            = true
+wavelength_um      = 0.351
+beam_radius        = 0.1
+rays               = 10
+absorb_at_critical = 0.0
+power              = 0.0 1e18   1e-9 1e18
+
+[output]
+directory = out_raytest
+
+[material dt]
+eos        = ideal
+gamma      = 1.6666667
+A          = 2.5
+Z          = 1.0
+ionization = fixed
+
+[layer]
+material  = dt
+thickness = 0.1
+zones     = 100
+rho0      = 0.024213   # ne = 0.64 * n_crit(351 nm) = 5.791e21 cm^-3
+T0        = 1000.0

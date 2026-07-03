@@ -18,9 +18,22 @@ int main(int argc, char** argv) {
         std::cout << ThomasFermiZbar(Z, A).zbar(rho, T) << "\n";
         return 0;
     }
+    // Utility: trace the laser through the initial state and print per-ray
+    // turning radii and absorbed fractions.
+    if (argc == 3 && std::string(argv[1]) == "--raytrace") {
+        try {
+            Simulation sim(parseDeck(argv[2]));
+            sim.rayTraceReport();
+        } catch (const std::exception& ex) {
+            std::cerr << "hydro1d: error: " << ex.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
     if (argc != 2) {
         std::cerr << "usage: hydro1d INPUT_DECK\n"
-                  << "       hydro1d --tf Z A rho[g/cc] T[eV]   (print TF Zbar)\n";
+                  << "       hydro1d --tf Z A rho[g/cc] T[eV]   (print TF Zbar)\n"
+                  << "       hydro1d --raytrace INPUT_DECK      (laser ray diagnostics)\n";
         return 2;
     }
     try {
