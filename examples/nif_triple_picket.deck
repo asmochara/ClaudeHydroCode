@@ -1,0 +1,102 @@
+# 1.5-MJ triple-picket symmetric direct-drive NIF design from Craxton et al.,
+# "Direct-drive inertial confinement fusion: A review", Phys. Plasmas 22,
+# 110501 (2015), Fig. 3-1 (predicted 1-D gain 48 by LILAC with full design
+# physics; this code has no alpha heating or CBET, so expect a burn-off
+# yield far below that -- see README).
+#
+# Target: 1700 um outer radius = 1503 um DT vapor + 160 um DT ice + 37 um CH.
+# Pulse: three pickets (~55, 45, 90 TW) to set the shocks and adiabat, a
+# 100 TW step, then a 295 TW main drive until 10.3 ns; ~1.5 MJ total.
+# Beams: 351 nm, super-Gaussian order 5, 1/e radius = 0.86 * target radius.
+#
+# Generate the demo opacity tables first:
+#   python3 tools/make_test_opacity.py examples/dt.opac --Z 1   --A 2.5
+#   python3 tools/make_test_opacity.py examples/ch.opac --Z 3.5 --A 6.51
+
+[control]
+geometry     = spherical
+temperatures = 2
+t_end        = 14e-9
+dt_init      = 1e-14
+cfl          = 0.35
+bc_outer     = free
+T_floor      = 0.01
+
+[conduction]
+enabled      = true
+flux_limiter = 0.06
+ln_lambda    = auto
+
+[radiation]
+enabled  = true
+bc_outer = vacuum
+
+[laser]
+enabled            = true
+wavelength_um      = 0.351
+profile            = supergaussian
+sg_order           = 5
+beam_radius        = 0.1462   # cm = 0.86 * 1700 um target radius
+rays               = 64
+absorb_at_critical = 0.1
+# Digitized from Fig. 3-1 (time [s], total power [erg/s]; 1 TW = 1e19 erg/s):
+# picket 1 (55 TW), picket 2 (45 TW), picket 3 (90 TW), 100 TW step,
+# 295 TW main pulse, off at 10.35 ns. Integrates to ~1.5 MJ.
+power = 0.0 0   0.15e-9 5.5e20   0.40e-9 2e19   1.65e-9 2e19   1.90e-9 4.5e20   2.15e-9 2e19   3.35e-9 2e19   3.60e-9 9.0e20   3.85e-9 2e19   4.60e-9 2e19   4.75e-9 1.0e21   5.60e-9 1.0e21   5.75e-9 2.95e21   10.2e-9 2.95e21   10.35e-9 0
+
+[output]
+directory      = out_nif
+dt_dump        = 0.5e-9
+history_stride = 50
+
+[material dt_gas]
+fuel          = true
+xD            = 0.5
+xT            = 0.5
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material dt_ice]
+fuel          = true
+xD            = 0.5
+xT            = 0.5
+eos           = ideal
+gamma         = 1.6666667
+A             = 2.5
+Z             = 1.0
+ionization    = tf
+opacity_table = examples/dt.opac
+
+[material ch]
+eos           = ideal
+gamma         = 1.6666667
+A             = 6.51
+Z             = 3.5
+ionization    = tf
+opacity_table = examples/ch.opac
+
+[layer]
+material  = dt_gas
+thickness = 0.1503    # cm (inner radius of the ice)
+zones     = 140
+rho0      = 6e-4      # DT vapor at the triple point [g/cc]
+T0        = 0.025
+
+[layer]
+material  = dt_ice
+thickness = 0.0160    # 160 um cryogenic DT ice
+zones     = 120
+rho0      = 0.25
+T0        = 0.025
+
+[layer]
+material  = ch
+thickness = 0.0037    # 37 um CH ablator
+zones     = 60
+rho0      = 1.05
+T0        = 0.025
+ratio     = 0.3       # feather zones finer toward the ablation surface

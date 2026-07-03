@@ -182,6 +182,19 @@ Example decks (all runtimes seconds on one core):
   `--raytrace`): a uniform sphere with refractive index 0.6; the reported
   turning radii match Bouguer's law (r_turn = b/0.6, total external
   reflection for b > 0.6R) to machine precision.
+- `examples/nif_triple_picket.deck` — the published 1.5-MJ triple-picket
+  symmetric direct-drive NIF design of Craxton et al., Phys. Plasmas 22,
+  110501 (2015), Fig. 3-1 (1700 um target: DT gas / 160 um DT ice / 37 um
+  CH; three pickets + 295 TW main pulse; SG5 beams at 0.86 of the target
+  radius). This code reproduces the design's absorbed fraction (~83%),
+  implosion velocity (350 km/s), and bang time (11.1 ns) well, but the
+  shocks set by the pickets are mistimed on the ideal EOS and the demo
+  opacities preheat the fuel, so the shell rides adiabat ~5 instead of ~2
+  and stagnates at rhoR ~ 0.4 g/cm^2 (design ~1.9): burn-off yield
+  1.4e16 DT neutrons (~40 kJ) versus the paper's 1-D gain-48 prediction
+  with alpha heating. A good illustration of exactly which physics
+  fidelity (EOS-driven shock timing, real opacities, alpha deposition)
+  buys the rest.
 - `examples/icf_direct_drive.deck` — the same capsule driven by the laser
   instead of an applied pressure (351 nm, ~60 TW peak, `bc_outer = free`).
   Absorption bootstraps from the critical-surface dump on cold solid to
