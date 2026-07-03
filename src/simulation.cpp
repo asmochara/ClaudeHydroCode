@@ -1,3 +1,9 @@
+// ============================================================================
+// simulation.cpp -- the Lagrangian hydro engine and all operator-split
+// physics stages. See simulation.hpp for the mesh layout, stage ordering,
+// and the unit-suffix naming convention (_cm, _s, _gcc, _eV, _dyncm2, ...).
+// ============================================================================
+
 #include "simulation.hpp"
 #include "constants.hpp"
 #include "fusion.hpp"
@@ -13,1151 +19,1859 @@
 #include <stdexcept>
 
 namespace {
-// Braginskii electron-conduction coefficient vs Z, fit through the tabulated
-// values (3.16 at Z=1, approaching the Lorentz limit at high Z).
-double braginskiiGamma0(double Z) {
-    return 13.58 * (Z + 0.24) / (Z + 4.24);
+
+// Braginskii electron-conduction coefficient gamma0 as a function of ion
+// charge: kappa_e = gamma0 * ne kB Te tau_e / me. This rational fit passes
+// through the tabulated Braginskii values (3.16 at Z=1) and approaches the
+// Lorentz-gas limit at high Z.
+double braginskiiGamma0(double ionCharge) {
+    return 13.58 * (ionCharge + 0.24) / (ionCharge + 4.24);
 }
 
-// Levermore-Pomraning flux limiter for radiation diffusion.
-double lpLambda(double R) {
+// Levermore-Pomraning flux limiter for radiation diffusion. The argument
+// R = |grad Er| / (kappa_R rho Er) measures how steep the radiation field is
+// in units of the photon mean free path: lambda(R->0) = 1/3 recovers classic
+// diffusion, lambda(R->inf) ~ 1/R caps the flux at the free-streaming value
+// c*Er.
+double levermorePomraningLambda(double R) {
     return (2.0 + R) / (6.0 + 3.0 * R + R * R);
 }
 
-// Solve the tridiagonal system a x_{k-1} + b x_k + c x_{k+1} = d in place.
-void thomasSolve(std::vector<double>& a, std::vector<double>& b,
-                 std::vector<double>& c, std::vector<double>& d,
-                 std::vector<double>& x) {
-    const int n = static_cast<int>(b.size());
+// Solve the tridiagonal linear system
+//   lower[k]*x[k-1] + diag[k]*x[k] + upper[k]*x[k+1] = rhs[k]
+// by the Thomas algorithm (forward elimination + back substitution).
+// diag and rhs are modified in place. O(n), no pivoting -- all our systems
+// are diagonally dominant (backward-Euler diffusion matrices), so this is
+// unconditionally safe here.
+void thomasSolve(std::vector<double>& lower, std::vector<double>& diag,
+                 std::vector<double>& upper, std::vector<double>& rhs,
+                 std::vector<double>& solution) {
+    const int n = static_cast<int>(diag.size());
     for (int k = 1; k < n; ++k) {
-        const double w = a[k] / b[k - 1];
-        b[k] -= w * c[k - 1];
-        d[k] -= w * d[k - 1];
+        const double w = lower[k] / diag[k - 1];
+        diag[k] -= w * upper[k - 1];
+        rhs[k] -= w * rhs[k - 1];
     }
-    x[n - 1] = d[n - 1] / b[n - 1];
-    for (int k = n - 2; k >= 0; --k) x[k] = (d[k] - c[k] * x[k + 1]) / b[k];
+    solution[n - 1] = rhs[n - 1] / diag[n - 1];
+    for (int k = n - 2; k >= 0; --k)
+        solution[k] = (rhs[k] - upper[k] * solution[k + 1]) / diag[k];
 }
+
 }  // namespace
 
+// ============================================================================
+// Construction: instantiate the material models requested by the deck
+// (EOS, ionization, opacity) and build the initial mesh.
+// ============================================================================
 Simulation::Simulation(const InputDeck& deck) : deck_(deck) {
-    twoT_ = (deck_.control.temperatures == 2);
-    rad_ = deck_.radiation.enabled;
-    laser_ = deck_.laser.enabled;
-    if (laser_) {
-        // n_crit = pi me c^2 / (e^2 lambda^2) = 1.11485e21 / lambda_um^2 cm^-3
-        const double lu = deck_.laser.wavelength_um;
-        ncrit_ = 1.11485e21 / (lu * lu);
+    twoTemperature_ = (deck_.control.temperatures == 2);
+    radiationOn_ = deck_.radiation.enabled;
+    laserOn_ = deck_.laser.enabled;
+    if (laserOn_) {
+        // Critical electron density, where the plasma frequency equals the
+        // laser frequency and light can no longer propagate:
+        //   n_crit = pi me c^2 / (e^2 lambda^2) = 1.11485e21 / lambda_um^2
+        const double wavelength_um = deck_.laser.wavelength_um;
+        criticalElectronDensity_percc =
+            1.11485e21 / (wavelength_um * wavelength_um);
         buildRaySet();
     }
 
-    // Instantiate materials in a deterministic order and remember indices.
+    // Instantiate materials. deck_.materials is a std::map, so iteration
+    // order (and therefore material indexing) is deterministic: sorted by
+    // material name.
     for (const auto& [name, spec] : deck_.materials) {
-        Material m;
-        m.name = name;
-        m.A = spec.A;
-        m.Z = spec.Z;
-        m.fuel = spec.fuel;
-        m.xD = spec.xD;
-        m.xT = spec.xT;
-        if (deck_.burn.enabled && (spec.xD > 0.0 || spec.xT > 0.0)) burn_ = true;
-        m.zbar = makeZbarModel(spec.ionization, spec.Z, spec.A, spec.zbar_table);
-        if (twoT_) {
+        Material material;
+        material.name = name;
+        material.A = spec.A;
+        material.Z = spec.Z;
+        material.fuel = spec.fuel;
+        material.xD = spec.xD;
+        material.xT = spec.xT;
+        // Burn diagnostics run only if some material actually contains
+        // deuterium or tritium (and the [burn] section didn't disable them).
+        if (deck_.burn.enabled && (spec.xD > 0.0 || spec.xT > 0.0))
+            burnOn_ = true;
+        material.zbar =
+            makeZbarModel(spec.ionization, spec.Z, spec.A, spec.zbar_table);
+        if (twoTemperature_) {
+            // 2T mode: separate ion and electron partial EOS.
             if (spec.eos == "ideal") {
-                m.ion = std::make_shared<IdealIonEOS>(spec.gamma, spec.A);
-                m.ele = std::make_shared<IdealElectronEOS>(spec.gamma, spec.A, m.zbar,
-                                                           spec.degeneracy);
+                material.ion = std::make_shared<IdealIonEOS>(spec.gamma, spec.A);
+                material.ele = std::make_shared<IdealElectronEOS>(
+                    spec.gamma, spec.A, material.zbar, spec.degeneracy);
             } else {
-                m.ion = std::make_shared<TableSpeciesEOS>(spec.table_ion);
-                m.ele = std::make_shared<TableSpeciesEOS>(spec.table_electron);
+                material.ion = std::make_shared<TableSpeciesEOS>(spec.table_ion);
+                material.ele = std::make_shared<TableSpeciesEOS>(spec.table_electron);
             }
         } else {
+            // 1T mode: one total-matter EOS.
             if (spec.eos == "ideal")
-                m.eos = std::make_shared<IdealGasEOS>(spec.gamma, spec.A, m.zbar);
+                material.eos = std::make_shared<IdealGasEOS>(spec.gamma, spec.A,
+                                                             material.zbar);
             else
-                m.eos = std::make_shared<TabulatedEOS>(spec.table_file);
+                material.eos = std::make_shared<TabulatedEOS>(spec.table_file);
         }
-        if (rad_) {
+        if (radiationOn_) {
             if (!spec.opacity_table.empty())
-                m.opacity = std::make_shared<TableOpacity>(spec.opacity_table);
+                material.opacity = std::make_shared<TableOpacity>(spec.opacity_table);
             else
-                m.opacity = std::make_shared<ConstOpacity>(spec.kappa_R, spec.kappa_P);
+                material.opacity =
+                    std::make_shared<ConstOpacity>(spec.kappa_R, spec.kappa_P);
         }
-        mats_.push_back(std::move(m));
+        materials_.push_back(std::move(material));
     }
     setupMesh();
 }
 
-double Simulation::area(double r_) const {
+// ============================================================================
+// Geometry: face area and shell volume for planar (d=1), cylindrical (d=2),
+// and spherical (d=3) symmetry. Planar quantities are per unit area,
+// cylindrical per unit length, so "volume" has units cm, cm^2, cm^3
+// respectively -- but every use pairs volume with density consistently, so
+// zone masses are per-unit-area / per-unit-length masses in the reduced
+// geometries and everything stays dimensionally coherent.
+// ============================================================================
+double Simulation::faceArea(double radius_cm) const {
     switch (deck_.control.geometry) {
         case 1: return 1.0;
-        case 2: return 2.0 * phys::pi * r_;
-        default: return 4.0 * phys::pi * r_ * r_;
+        case 2: return 2.0 * phys::pi * radius_cm;
+        default: return 4.0 * phys::pi * radius_cm * radius_cm;
     }
 }
 
-double Simulation::volume(double r0, double r1) const {
+double Simulation::shellVolume(double innerRadius_cm, double outerRadius_cm) const {
     switch (deck_.control.geometry) {
-        case 1: return r1 - r0;
-        case 2: return phys::pi * (r1 * r1 - r0 * r0);
-        default: return 4.0 / 3.0 * phys::pi * (r1 * r1 * r1 - r0 * r0 * r0);
+        case 1:
+            return outerRadius_cm - innerRadius_cm;
+        case 2:
+            return phys::pi * (outerRadius_cm * outerRadius_cm -
+                               innerRadius_cm * innerRadius_cm);
+        default:
+            return 4.0 / 3.0 * phys::pi *
+                   (outerRadius_cm * outerRadius_cm * outerRadius_cm -
+                    innerRadius_cm * innerRadius_cm * innerRadius_cm);
     }
 }
 
+// ============================================================================
+// Mesh setup: lay down the layers innermost-first, assign initial
+// thermodynamic state, and freeze the Lagrangian zone masses.
+// ============================================================================
 void Simulation::setupMesh() {
-    auto matIndex = [&](const std::string& name) {
-        for (size_t k = 0; k < mats_.size(); ++k)
-            if (mats_[k].name == name) return static_cast<int>(k);
+    // Map a material name from a layer spec to its index in materials_.
+    auto materialIndexByName = [&](const std::string& name) {
+        for (size_t k = 0; k < materials_.size(); ++k)
+            if (materials_[k].name == name) return static_cast<int>(k);
         throw std::runtime_error("unknown material " + name);
     };
 
-    M = 0;
-    for (const auto& l : deck_.layers) M += l.zones;
-    r.assign(M + 1, 0.0);
-    u.assign(M + 1, 0.0);
-    dmNode.assign(M + 1, 0.0);
-    dm.assign(M, 0.0);
-    rho.assign(M, 0.0);
-    P.assign(M, 0.0);
-    cs.assign(M, 0.0);
-    q.assign(M, 0.0);
-    zb.assign(M, 0.0);
-    matid.assign(M, 0);
-    if (twoT_) {
-        ei.assign(M, 0.0); ee.assign(M, 0.0);
-        Ti.assign(M, 0.0); Te.assign(M, 0.0);
-        Pi_.assign(M, 0.0); Pe_.assign(M, 0.0);
+    numZones_ = 0;
+    for (const auto& layer : deck_.layers) numZones_ += layer.zones;
+    nodeRadius_cm.assign(numZones_ + 1, 0.0);
+    nodeVelocity_cmps.assign(numZones_ + 1, 0.0);
+    nodeMass_g.assign(numZones_ + 1, 0.0);
+    zoneMass_g.assign(numZones_, 0.0);
+    zoneDensity_gcc.assign(numZones_, 0.0);
+    zonePressure_dyncm2.assign(numZones_, 0.0);
+    zoneSoundSpeed_cmps.assign(numZones_, 0.0);
+    zoneViscousPressure_dyncm2.assign(numZones_, 0.0);
+    zoneMeanIonization.assign(numZones_, 0.0);
+    zoneMaterialIndex.assign(numZones_, 0);
+    if (twoTemperature_) {
+        ionSpecificEnergy_ergg.assign(numZones_, 0.0);
+        electronSpecificEnergy_ergg.assign(numZones_, 0.0);
+        ionTemperature_eV.assign(numZones_, 0.0);
+        electronTemperature_eV.assign(numZones_, 0.0);
+        ionPressure_dyncm2.assign(numZones_, 0.0);
+        electronPressure_dyncm2.assign(numZones_, 0.0);
     } else {
-        e.assign(M, 0.0);
-        T.assign(M, 0.0);
+        zoneSpecificEnergy_ergg.assign(numZones_, 0.0);
+        zoneTemperature_eV.assign(numZones_, 0.0);
     }
-    if (rad_) Er.assign(M, 0.0);
+    if (radiationOn_) radiationEnergyDensity_ergcc.assign(numZones_, 0.0);
 
-    // Node positions: per layer, zone widths follow a geometric progression
-    // with (outermost width)/(innermost width) = ratio.
-    int j = 0;
-    r[0] = deck_.control.r_min;
-    for (const auto& l : deck_.layers) {
-        const int N = l.zones;
-        const double g = (N > 1) ? std::pow(l.ratio, 1.0 / (N - 1)) : 1.0;
-        const double w1 = (std::abs(g - 1.0) < 1e-12)
-                              ? l.thickness / N
-                              : l.thickness * (1.0 - g) / (1.0 - std::pow(g, N));
-        double w = w1;
-        const int mi = matIndex(l.material);
-        const auto& mat = mats_[mi];
+    // ---- node positions ----------------------------------------------------
+    // Within each layer the zone widths follow a geometric progression with
+    // (outermost width)/(innermost width) = layer.ratio, so the user can
+    // "feather" the mesh finer toward one side (e.g. finer zones at the
+    // ablation surface). ratio = 1 gives uniform zoning.
+    int zone = 0;
+    nodeRadius_cm[0] = deck_.control.r_min;
+    for (const auto& layer : deck_.layers) {
+        const int layerZoneCount = layer.zones;
+        // Common ratio g between adjacent zone widths, and the first width
+        // w1 chosen so the widths sum exactly to the layer thickness.
+        const double g = (layerZoneCount > 1)
+                             ? std::pow(layer.ratio, 1.0 / (layerZoneCount - 1))
+                             : 1.0;
+        const double firstWidth_cm =
+            (std::abs(g - 1.0) < 1e-12)
+                ? layer.thickness / layerZoneCount
+                : layer.thickness * (1.0 - g) / (1.0 - std::pow(g, layerZoneCount));
+        double width_cm = firstWidth_cm;
+        const int materialIndex = materialIndexByName(layer.material);
+        const auto& material = materials_[materialIndex];
 
-        // Base temperature from T0 or from inverting the total pressure.
-        double Tbase = l.T0;
-        if (Tbase <= 0.0 && l.P0 > 0.0) {
-            if (twoT_) {
-                Tbase = invertMonotone(
-                    [&](double Tx) {
-                        return mat.ion->pressure(l.rho0, Tx) +
-                               mat.ele->pressure(l.rho0, Tx);
+        // ---- initial temperature ---------------------------------------
+        // The layer gives either T0 directly or P0, in which case we invert
+        // the (total) pressure at the layer density for the temperature.
+        double baseTemperature_eV = layer.T0;
+        if (baseTemperature_eV <= 0.0 && layer.P0 > 0.0) {
+            if (twoTemperature_) {
+                baseTemperature_eV = invertMonotone(
+                    [&](double trialT_eV) {
+                        return material.ion->pressure(layer.rho0, trialT_eV) +
+                               material.ele->pressure(layer.rho0, trialT_eV);
                     },
-                    l.P0, 1e-12, 1e9, 1.0);
+                    layer.P0, 1e-12, 1e9, 1.0);
             } else {
-                Tbase = mat.eos->temperatureFromPressure(l.rho0, l.P0);
+                baseTemperature_eV =
+                    material.eos->temperatureFromPressure(layer.rho0, layer.P0);
             }
         }
 
-        for (int k = 0; k < N; ++k, ++j) {
-            r[j + 1] = r[j] + w;
-            w *= g;
-            matid[j] = mi;
-            rho[j] = l.rho0;
-            const double Tf = deck_.control.T_floor;
-            if (twoT_) {
-                Ti[j] = std::max((l.Ti0 > 0.0) ? l.Ti0 : Tbase, Tf);
-                Te[j] = std::max((l.Te0 > 0.0) ? l.Te0 : Tbase, Tf);
-                ei[j] = mat.ion->energy(rho[j], Ti[j]);
-                ee[j] = mat.ele->energy(rho[j], Te[j]);
+        for (int k = 0; k < layerZoneCount; ++k, ++zone) {
+            nodeRadius_cm[zone + 1] = nodeRadius_cm[zone] + width_cm;
+            width_cm *= g;
+            zoneMaterialIndex[zone] = materialIndex;
+            zoneDensity_gcc[zone] = layer.rho0;
+            const double floorT_eV = deck_.control.T_floor;
+            if (twoTemperature_) {
+                // Optional per-species overrides Ti0/Te0; otherwise both
+                // species start at the common base temperature.
+                ionTemperature_eV[zone] =
+                    std::max((layer.Ti0 > 0.0) ? layer.Ti0 : baseTemperature_eV,
+                             floorT_eV);
+                electronTemperature_eV[zone] =
+                    std::max((layer.Te0 > 0.0) ? layer.Te0 : baseTemperature_eV,
+                             floorT_eV);
+                ionSpecificEnergy_ergg[zone] =
+                    material.ion->energy(zoneDensity_gcc[zone],
+                                         ionTemperature_eV[zone]);
+                electronSpecificEnergy_ergg[zone] =
+                    material.ele->energy(zoneDensity_gcc[zone],
+                                         electronTemperature_eV[zone]);
             } else {
-                T[j] = std::max(Tbase, Tf);
-                e[j] = mat.eos->energy(rho[j], T[j]);
+                zoneTemperature_eV[zone] = std::max(baseTemperature_eV, floorT_eV);
+                zoneSpecificEnergy_ergg[zone] =
+                    material.eos->energy(zoneDensity_gcc[zone],
+                                         zoneTemperature_eV[zone]);
             }
-            if (rad_) {
-                const double Tr = (l.Tr0 > 0.0) ? l.Tr0
-                                                : (twoT_ ? Te[j] : T[j]);
-                Er[j] = phys::a_rad * Tr * Tr * Tr * Tr;
+            if (radiationOn_) {
+                // Radiation starts in equilibrium with the (electron)
+                // temperature unless the layer sets Tr0 explicitly.
+                const double radiationTemperature_eV =
+                    (layer.Tr0 > 0.0)
+                        ? layer.Tr0
+                        : (twoTemperature_ ? electronTemperature_eV[zone]
+                                           : zoneTemperature_eV[zone]);
+                radiationEnergyDensity_ergcc[zone] =
+                    phys::a_rad * radiationTemperature_eV * radiationTemperature_eV *
+                    radiationTemperature_eV * radiationTemperature_eV;
             }
         }
     }
-    // Recompute exact layer boundaries to avoid width round-off drift.
+    // The geometric widths accumulate floating-point round-off; pin the
+    // layer boundaries back to their exact positions so material interfaces
+    // land where the deck says.
     {
-        int jj = 0;
-        double edge = deck_.control.r_min;
-        for (const auto& l : deck_.layers) {
-            edge += l.thickness;
-            jj += l.zones;
-            r[jj] = edge;
+        int boundaryNode = 0;
+        double layerEdge_cm = deck_.control.r_min;
+        for (const auto& layer : deck_.layers) {
+            layerEdge_cm += layer.thickness;
+            boundaryNode += layer.zones;
+            nodeRadius_cm[boundaryNode] = layerEdge_cm;
         }
     }
 
-    for (int k = 0; k < M; ++k) dm[k] = rho[k] * volume(r[k], r[k + 1]);
-    for (int i = 1; i < M; ++i) dmNode[i] = 0.5 * (dm[i - 1] + dm[i]);
-    dmNode[0] = 0.5 * dm[0];
-    dmNode[M] = 0.5 * dm[M - 1];
+    // ---- Lagrangian masses ---------------------------------------------------
+    // Zone masses are fixed forever after this point. Node masses (used in
+    // the momentum equation) are the half-masses of the two adjacent zones;
+    // the boundary nodes carry half of their single neighboring zone.
+    for (int k = 0; k < numZones_; ++k)
+        zoneMass_g[k] = zoneDensity_gcc[k] *
+                        shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
+    for (int i = 1; i < numZones_; ++i)
+        nodeMass_g[i] = 0.5 * (zoneMass_g[i - 1] + zoneMass_g[i]);
+    nodeMass_g[0] = 0.5 * zoneMass_g[0];
+    nodeMass_g[numZones_] = 0.5 * zoneMass_g[numZones_ - 1];
 
-    // Shot-report bookkeeping: fuel zones and the hot-spot boundary (the
-    // outer node of the innermost layer).
-    fuelZone_.assign(M, 0);
+    // ---- shot-report bookkeeping ----------------------------------------------
+    // Fuel zones drive the report's implosion metrics; the "hot spot" is the
+    // innermost layer, and its outer boundary node (a fixed Lagrangian node,
+    // so it tracks the gas/shell interface for all time) defines the
+    // convergence ratio.
+    zoneIsFuel_.assign(numZones_, 0);
     noFuelFlag_ = true;
-    for (int k = 0; k < M; ++k)
-        if (mats_[matid[k]].fuel) { fuelZone_[k] = 1; noFuelFlag_ = false; }
+    for (int k = 0; k < numZones_; ++k)
+        if (materials_[zoneMaterialIndex[k]].fuel) {
+            zoneIsFuel_[k] = 1;
+            noFuelFlag_ = false;
+        }
     if (noFuelFlag_)
-        for (int k = 0; k < M; ++k) fuelZone_[k] = 1;  // fall back to all zones
-    hsNode_ = deck_.layers.front().zones;
-    rIf0_ = r[hsNode_];
+        for (int k = 0; k < numZones_; ++k) zoneIsFuel_[k] = 1;  // fall back: all
+    hotSpotNode_ = deck_.layers.front().zones;
+    hotSpotRadius0_cm = nodeRadius_cm[hotSpotNode_];
 
-    updateEosDerived();
+    updateThermodynamics();
 
-    E0 = 0.0;  // starts at rest
-    for (int k = 0; k < M; ++k) {
-        E0 += dm[k] * (twoT_ ? ei[k] + ee[k] : e[k]);
-        if (rad_) E0 += Er[k] * volume(r[k], r[k + 1]);
+    // Total energy at t = 0 (the fluid starts at rest, so no kinetic term).
+    // This anchors the energy-conservation diagnostic in the history file.
+    initialTotalEnergy_erg = 0.0;
+    for (int k = 0; k < numZones_; ++k) {
+        initialTotalEnergy_erg +=
+            zoneMass_g[k] * (twoTemperature_
+                                 ? ionSpecificEnergy_ergg[k] +
+                                       electronSpecificEnergy_ergg[k]
+                                 : zoneSpecificEnergy_ergg[k]);
+        if (radiationOn_)
+            initialTotalEnergy_erg +=
+                radiationEnergyDensity_ergcc[k] *
+                shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
     }
 }
 
-void Simulation::updateEosDerived() {
+// ============================================================================
+// Thermodynamic refresh: invert temperature from (density, specific energy)
+// -- energy is the conserved quantity the physics stages update -- then
+// evaluate pressure, mean ionization, and the adiabatic sound speed used by
+// the CFL condition and the artificial viscosity.
+// ============================================================================
+void Simulation::updateThermodynamics() {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        double cs2;
-        if (twoT_) {
-            Ti[k] = m.ion->temperature(rho[k], ei[k], Ti[k]);
-            Te[k] = m.ele->temperature(rho[k], ee[k], Te[k]);
-            Pi_[k] = m.ion->pressure(rho[k], Ti[k]);
-            Pe_[k] = m.ele->pressure(rho[k], Te[k]);
-            P[k] = Pi_[k] + Pe_[k];
-            zb[k] = m.zbar->zbar(rho[k], Te[k]);
-            cs2 = m.ion->cs2Contribution(rho[k], Ti[k]) +
-                  m.ele->cs2Contribution(rho[k], Te[k]);
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        double soundSpeedSq_cm2s2;
+        if (twoTemperature_) {
+            // The previous temperature is passed as the inversion's initial
+            // guess -- state changes little per step, so this converges in a
+            // few iterations.
+            ionTemperature_eV[k] = material.ion->temperature(
+                zoneDensity_gcc[k], ionSpecificEnergy_ergg[k], ionTemperature_eV[k]);
+            electronTemperature_eV[k] = material.ele->temperature(
+                zoneDensity_gcc[k], electronSpecificEnergy_ergg[k],
+                electronTemperature_eV[k]);
+            ionPressure_dyncm2[k] =
+                material.ion->pressure(zoneDensity_gcc[k], ionTemperature_eV[k]);
+            electronPressure_dyncm2[k] =
+                material.ele->pressure(zoneDensity_gcc[k], electronTemperature_eV[k]);
+            zonePressure_dyncm2[k] = ionPressure_dyncm2[k] + electronPressure_dyncm2[k];
+            // Mean ionization follows the electron temperature.
+            zoneMeanIonization[k] =
+                material.zbar->zbar(zoneDensity_gcc[k], electronTemperature_eV[k]);
+            soundSpeedSq_cm2s2 =
+                material.ion->cs2Contribution(zoneDensity_gcc[k],
+                                              ionTemperature_eV[k]) +
+                material.ele->cs2Contribution(zoneDensity_gcc[k],
+                                              electronTemperature_eV[k]);
         } else {
-            T[k] = m.eos->temperature(rho[k], e[k], T[k]);
-            P[k] = m.eos->pressure(rho[k], T[k]);
-            zb[k] = m.zbar->zbar(rho[k], T[k]);
-            cs2 = m.eos->soundSpeed2(rho[k], T[k]);
+            zoneTemperature_eV[k] = material.eos->temperature(
+                zoneDensity_gcc[k], zoneSpecificEnergy_ergg[k], zoneTemperature_eV[k]);
+            zonePressure_dyncm2[k] =
+                material.eos->pressure(zoneDensity_gcc[k], zoneTemperature_eV[k]);
+            zoneMeanIonization[k] =
+                material.zbar->zbar(zoneDensity_gcc[k], zoneTemperature_eV[k]);
+            soundSpeedSq_cm2s2 =
+                material.eos->soundSpeed2(zoneDensity_gcc[k], zoneTemperature_eV[k]);
         }
-        if (rad_) cs2 += (4.0 / 9.0) * Er[k] / rho[k];
-        cs[k] = std::sqrt(cs2);
+        // Radiation adds gamma_rad * P_rad / rho = (4/3)(Er/3)/rho to the
+        // sound speed (Eddington closure), which matters once aT^4 rivals
+        // the matter pressure.
+        if (radiationOn_)
+            soundSpeedSq_cm2s2 += (4.0 / 9.0) * radiationEnergyDensity_ergcc[k] /
+                                  zoneDensity_gcc[k];
+        zoneSoundSpeed_cmps[k] = std::sqrt(soundSpeedSq_cm2s2);
     }
 }
 
-void Simulation::applyFloors() {
-    const double Tf = deck_.control.T_floor;
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        if (twoT_) {
-            if (Ti[k] < Tf) {
-                const double en = m.ion->energy(rho[k], Tf);
-                Efloor += dm[k] * (en - ei[k]);
-                Ti[k] = Tf;
-                ei[k] = en;
+// ============================================================================
+// Temperature floors: keep every temperature at or above control.T_floor so
+// transport coefficients (which scale like powers of T) never see zero or
+// negative temperatures. Flooring ADDS energy that did not come from any
+// physical source; the total injected is accumulated so the energy-
+// conservation diagnostic can account for it explicitly rather than
+// misreporting it as a solver error.
+// ============================================================================
+void Simulation::applyTemperatureFloors() {
+    const double floorT_eV = deck_.control.T_floor;
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        if (twoTemperature_) {
+            if (ionTemperature_eV[k] < floorT_eV) {
+                const double flooredEnergy_ergg =
+                    material.ion->energy(zoneDensity_gcc[k], floorT_eV);
+                floorEnergyInjected_erg +=
+                    zoneMass_g[k] * (flooredEnergy_ergg - ionSpecificEnergy_ergg[k]);
+                ionTemperature_eV[k] = floorT_eV;
+                ionSpecificEnergy_ergg[k] = flooredEnergy_ergg;
             }
-            if (Te[k] < Tf) {
-                const double en = m.ele->energy(rho[k], Tf);
-                Efloor += dm[k] * (en - ee[k]);
-                Te[k] = Tf;
-                ee[k] = en;
+            if (electronTemperature_eV[k] < floorT_eV) {
+                const double flooredEnergy_ergg =
+                    material.ele->energy(zoneDensity_gcc[k], floorT_eV);
+                floorEnergyInjected_erg +=
+                    zoneMass_g[k] *
+                    (flooredEnergy_ergg - electronSpecificEnergy_ergg[k]);
+                electronTemperature_eV[k] = floorT_eV;
+                electronSpecificEnergy_ergg[k] = flooredEnergy_ergg;
             }
         } else {
-            if (T[k] < Tf) {
-                const double en = m.eos->energy(rho[k], Tf);
-                Efloor += dm[k] * (en - e[k]);
-                T[k] = Tf;
-                e[k] = en;
+            if (zoneTemperature_eV[k] < floorT_eV) {
+                const double flooredEnergy_ergg =
+                    material.eos->energy(zoneDensity_gcc[k], floorT_eV);
+                floorEnergyInjected_erg +=
+                    zoneMass_g[k] * (flooredEnergy_ergg - zoneSpecificEnergy_ergg[k]);
+                zoneTemperature_eV[k] = floorT_eV;
+                zoneSpecificEnergy_ergg[k] = flooredEnergy_ergg;
             }
         }
-        if (rad_) {
-            const double Emin = phys::a_rad * Tf * Tf * Tf * Tf * 1e-6;
-            if (Er[k] < Emin) {
-                Efloor += (Emin - Er[k]) * volume(r[k], r[k + 1]);
-                Er[k] = Emin;
+        if (radiationOn_) {
+            // A very small radiation floor (equilibrium with T_floor scaled
+            // down by 1e-6) keeps Er positive without injecting meaningful
+            // energy.
+            const double minEr_ergcc =
+                phys::a_rad * floorT_eV * floorT_eV * floorT_eV * floorT_eV * 1e-6;
+            if (radiationEnergyDensity_ergcc[k] < minEr_ergcc) {
+                floorEnergyInjected_erg +=
+                    (minEr_ergcc - radiationEnergyDensity_ergcc[k]) *
+                    shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
+                radiationEnergyDensity_ergcc[k] = minEr_ergcc;
             }
         }
     }
 }
 
-double Simulation::computeDt() const {
-    double dt = deck_.control.dt_max;
-    for (int k = 0; k < M; ++k) {
-        const double dr = r[k + 1] - r[k];
-        const double du = std::max(0.0, -(u[k + 1] - u[k]));  // compression speed
-        const double sig = cs[k] + 4.0 * deck_.control.c_quad * du;
-        dt = std::min(dt, deck_.control.cfl * dr / sig);
+// ============================================================================
+// Time-step control. Only the explicit hydro is stability-limited (the
+// diffusion solves are implicit), so the constraint is the usual Courant
+// condition on the sound crossing time of each zone, stiffened by the
+// quadratic artificial viscosity's effective signal speed in compressing
+// zones (the standard von Neumann-Richtmyer prescription). The step is also
+// capped at dt_growth times the previous step so it recovers smoothly after
+// a transient.
+// ============================================================================
+double Simulation::computeTimeStep() const {
+    double dt_s = deck_.control.dt_max;
+    for (int k = 0; k < numZones_; ++k) {
+        const double zoneWidth_cm = nodeRadius_cm[k + 1] - nodeRadius_cm[k];
+        // Compression speed: positive when the zone is being squeezed.
+        const double compressionSpeed_cmps = std::max(
+            0.0, -(nodeVelocity_cmps[k + 1] - nodeVelocity_cmps[k]));
+        const double signalSpeed_cmps =
+            zoneSoundSpeed_cmps[k] +
+            4.0 * deck_.control.c_quad * compressionSpeed_cmps;
+        dt_s = std::min(dt_s, deck_.control.cfl * zoneWidth_cm / signalSpeed_cmps);
     }
-    if (dt_ > 0.0) dt = std::min(dt, dt_ * deck_.control.dt_growth);
-    return dt;
+    if (timeStep_s > 0.0) dt_s = std::min(dt_s, timeStep_s * deck_.control.dt_growth);
+    return dt_s;
 }
 
-void Simulation::hydroStep(double dt) {
-    const auto& c = deck_.control;
+// ============================================================================
+// Hydro step (von Neumann-Richtmyer leapfrog):
+//   1. accelerate nodes from the pressure + viscosity gradient  (u at n+1/2)
+//   2. move nodes and recompute densities                       (r at n+1)
+//   3. evaluate the artificial viscosity from the new velocities
+//   4. update specific internal energies from PdV work, with a predictor-
+//      corrector to time-center the pressure (2nd order on smooth flow)
+// ============================================================================
+void Simulation::hydroStep(double dt_s) {
+    const auto& control = deck_.control;
 
-    // --- momentum: u^{n+1/2} = u^{n-1/2} + dt * a^n -----------------------
-    // Total stress = matter pressure + radiation pressure (Er/3) + viscosity.
-    // Node 0 (center or inner wall) is fixed.
+    // ---- (1) momentum: u^{n+1/2} = u^{n-1/2} + dt * a^n ----------------------
+    // The force on a node is its face area times the jump in total stress
+    // (matter pressure + radiation pressure + artificial viscosity) across
+    // it. Node 0 (the center, or the inner wall if r_min > 0) is held fixed.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 1; i < M; ++i) {
-        const double f = -(P[i] + radP(i) + q[i] - P[i - 1] - radP(i - 1) - q[i - 1]);
-        u[i] += dt * area(r[i]) * f / dmNode[i];
+    for (int i = 1; i < numZones_; ++i) {
+        const double stressJump_dyncm2 =
+            -(zonePressure_dyncm2[i] + radiationPressure_dyncm2(i) +
+              zoneViscousPressure_dyncm2[i] - zonePressure_dyncm2[i - 1] -
+              radiationPressure_dyncm2(i - 1) - zoneViscousPressure_dyncm2[i - 1]);
+        nodeVelocity_cmps[i] +=
+            dt_s * faceArea(nodeRadius_cm[i]) * stressJump_dyncm2 / nodeMass_g[i];
     }
-    if (c.bc_outer == "pressure" || c.bc_outer == "free") {
-        const double pd = (c.bc_outer == "pressure") ? deck_.drive.pressure(t) : 0.0;
-        u[M] += dt * area(r[M]) * (P[M - 1] + radP(M - 1) + q[M - 1] - pd) / dmNode[M];
-        // Work done on the system by the applied pressure.
-        if (pd != 0.0) driveWork += -pd * area(r[M]) * u[M] * dt;
-    }  // else wall: u[M] stays 0
+    // Outer boundary: "wall" pins the node; "pressure" applies the drive
+    // table; "free" is a vacuum boundary (used with the laser so the corona
+    // can blow off and generate ablation pressure self-consistently).
+    if (control.bc_outer == "pressure" || control.bc_outer == "free") {
+        const double appliedPressure_dyncm2 =
+            (control.bc_outer == "pressure") ? deck_.drive.pressure(time_s) : 0.0;
+        nodeVelocity_cmps[numZones_] +=
+            dt_s * faceArea(nodeRadius_cm[numZones_]) *
+            (zonePressure_dyncm2[numZones_ - 1] +
+             radiationPressure_dyncm2(numZones_ - 1) +
+             zoneViscousPressure_dyncm2[numZones_ - 1] - appliedPressure_dyncm2) /
+            nodeMass_g[numZones_];
+        // Work done ON the system by the applied pressure (an inward-moving
+        // boundary against an external pressure gains energy), tracked for
+        // the energy-conservation diagnostic.
+        if (appliedPressure_dyncm2 != 0.0)
+            driveWorkDone_erg += -appliedPressure_dyncm2 *
+                                 faceArea(nodeRadius_cm[numZones_]) *
+                                 nodeVelocity_cmps[numZones_] * dt_s;
+    }  // else wall: nodeVelocity_cmps[numZones_] stays 0
 
-    // --- move nodes -------------------------------------------------------
-    std::vector<double> rhoOld = rho;
-    for (int i = 0; i <= M; ++i) r[i] += dt * u[i];
-    for (int k = 0; k < M; ++k) {
-        if (r[k + 1] <= r[k])
+    // ---- (2) move nodes and recompute densities -------------------------------
+    // Zone masses are constant (Lagrangian), so density follows from the new
+    // volume alone. Node crossings ("mesh tangling") indicate the time step
+    // was too large for the flow -- fatal, so fail loudly with advice.
+    std::vector<double> oldDensity_gcc = zoneDensity_gcc;
+    for (int i = 0; i <= numZones_; ++i)
+        nodeRadius_cm[i] += dt_s * nodeVelocity_cmps[i];
+    for (int k = 0; k < numZones_; ++k) {
+        if (nodeRadius_cm[k + 1] <= nodeRadius_cm[k])
             throw std::runtime_error("mesh tangled at zone " + std::to_string(k) +
-                                     ", t = " + std::to_string(t) +
+                                     ", t = " + std::to_string(time_s) +
                                      " s. Reduce cfl or increase viscosity.");
-        rho[k] = dm[k] / volume(r[k], r[k + 1]);
+        zoneDensity_gcc[k] =
+            zoneMass_g[k] / shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
     }
 
-    // --- artificial viscosity at n+1/2 -------------------------------------
+    // ---- (3) artificial viscosity at n+1/2 -------------------------------------
+    // Combined quadratic (von Neumann-Richtmyer) + linear (Landshoff)
+    // viscous pressure, active only in compression. It spreads shocks over a
+    // few zones so the difference equations can integrate through them; the
+    // linear term damps the residual post-shock ringing.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const double du = u[k + 1] - u[k];
-        if (du < 0.0) {
-            const double rb = 0.5 * (rho[k] + rhoOld[k]);
-            q[k] = rb * (-du) * (c.c_quad * (-du) + c.c_lin * cs[k]);
+    for (int k = 0; k < numZones_; ++k) {
+        const double velocityJump_cmps =
+            nodeVelocity_cmps[k + 1] - nodeVelocity_cmps[k];
+        if (velocityJump_cmps < 0.0) {  // compressing
+            const double midDensity_gcc =
+                0.5 * (zoneDensity_gcc[k] + oldDensity_gcc[k]);
+            zoneViscousPressure_dyncm2[k] =
+                midDensity_gcc * (-velocityJump_cmps) *
+                (control.c_quad * (-velocityJump_cmps) +
+                 control.c_lin * zoneSoundSpeed_cmps[k]);
         } else {
-            q[k] = 0.0;
+            zoneViscousPressure_dyncm2[k] = 0.0;
         }
     }
 
-    // --- energy: de = -(P+q) dV per species, predictor-corrector ----------
-    // In 2T mode the artificial-viscosity (shock) heating goes to the ions.
+    // ---- (4) internal energy: de = -(P + q) dV per unit mass -------------------
+    // dV is the change in SPECIFIC volume (1/rho). Using the beginning-of-
+    // step pressure alone would be only first-order accurate, so we take a
+    // predictor step to estimate the end-of-step pressure and use the
+    // average (time-centered pressure -> 2nd order on smooth flow). In 2T
+    // mode each species does its own PdV work with its own partial pressure,
+    // and the viscous (shock) heating goes entirely to the IONS -- physically,
+    // a shock thermalizes the ion flow first and electrons heat later
+    // through collisional coupling.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        const double dV = 1.0 / rho[k] - 1.0 / rhoOld[k];  // specific volume change
-        if (twoT_) {
-            const double eiP = std::max(ei[k] - (Pi_[k] + q[k]) * dV, 0.0);
-            const double TiP = m.ion->temperature(rho[k], eiP, Ti[k]);
-            const double PiP = m.ion->pressure(rho[k], std::max(TiP, c.T_floor));
-            ei[k] -= (0.5 * (Pi_[k] + PiP) + q[k]) * dV;
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        const double specificVolumeChange_ccg =
+            1.0 / zoneDensity_gcc[k] - 1.0 / oldDensity_gcc[k];
+        if (twoTemperature_) {
+            // Ions: predictor with old pressure (+ viscosity), then corrector
+            // with the average of old and predicted pressures.
+            const double ionEnergyPredicted_ergg =
+                std::max(ionSpecificEnergy_ergg[k] -
+                             (ionPressure_dyncm2[k] + zoneViscousPressure_dyncm2[k]) *
+                                 specificVolumeChange_ccg,
+                         0.0);
+            const double ionTempPredicted_eV = material.ion->temperature(
+                zoneDensity_gcc[k], ionEnergyPredicted_ergg, ionTemperature_eV[k]);
+            const double ionPressurePredicted_dyncm2 = material.ion->pressure(
+                zoneDensity_gcc[k], std::max(ionTempPredicted_eV, control.T_floor));
+            ionSpecificEnergy_ergg[k] -=
+                (0.5 * (ionPressure_dyncm2[k] + ionPressurePredicted_dyncm2) +
+                 zoneViscousPressure_dyncm2[k]) *
+                specificVolumeChange_ccg;
 
-            const double eeP = std::max(ee[k] - Pe_[k] * dV, 0.0);
-            const double TeP = m.ele->temperature(rho[k], eeP, Te[k]);
-            const double PeP = m.ele->pressure(rho[k], std::max(TeP, c.T_floor));
-            ee[k] -= 0.5 * (Pe_[k] + PeP) * dV;
+            // Electrons: same predictor-corrector, no viscous heating.
+            const double eleEnergyPredicted_ergg =
+                std::max(electronSpecificEnergy_ergg[k] -
+                             electronPressure_dyncm2[k] * specificVolumeChange_ccg,
+                         0.0);
+            const double eleTempPredicted_eV = material.ele->temperature(
+                zoneDensity_gcc[k], eleEnergyPredicted_ergg,
+                electronTemperature_eV[k]);
+            const double elePressurePredicted_dyncm2 = material.ele->pressure(
+                zoneDensity_gcc[k], std::max(eleTempPredicted_eV, control.T_floor));
+            electronSpecificEnergy_ergg[k] -=
+                0.5 *
+                (electronPressure_dyncm2[k] + elePressurePredicted_dyncm2) *
+                specificVolumeChange_ccg;
         } else {
-            const double ePred = std::max(e[k] - (P[k] + q[k]) * dV, 0.0);
-            const double Tp = m.eos->temperature(rho[k], ePred, T[k]);
-            const double Pp = m.eos->pressure(rho[k], std::max(Tp, c.T_floor));
-            e[k] -= (0.5 * (P[k] + Pp) + q[k]) * dV;
+            const double energyPredicted_ergg =
+                std::max(zoneSpecificEnergy_ergg[k] -
+                             (zonePressure_dyncm2[k] + zoneViscousPressure_dyncm2[k]) *
+                                 specificVolumeChange_ccg,
+                         0.0);
+            const double tempPredicted_eV = material.eos->temperature(
+                zoneDensity_gcc[k], energyPredicted_ergg, zoneTemperature_eV[k]);
+            const double pressurePredicted_dyncm2 = material.eos->pressure(
+                zoneDensity_gcc[k], std::max(tempPredicted_eV, control.T_floor));
+            zoneSpecificEnergy_ergg[k] -=
+                (0.5 * (zonePressure_dyncm2[k] + pressurePredicted_dyncm2) +
+                 zoneViscousPressure_dyncm2[k]) *
+                specificVolumeChange_ccg;
         }
-        // Radiation compresses adiabatically as a gamma = 4/3 gas.
-        if (rad_) Er[k] *= std::pow(rho[k] / rhoOld[k], 4.0 / 3.0);
+        // Radiation compresses adiabatically as a gamma = 4/3 gas:
+        // Er V^{4/3} = const  =>  Er scales as rho^{4/3}. This is exact for
+        // an isotropic photon gas and needs no predictor-corrector.
+        if (radiationOn_)
+            radiationEnergyDensity_ergcc[k] *=
+                std::pow(zoneDensity_gcc[k] / oldDensity_gcc[k], 4.0 / 3.0);
     }
 
-    updateEosDerived();
-    applyFloors();
+    updateThermodynamics();
+    applyTemperatureFloors();
 }
 
-double Simulation::coulombLog(double ne, double Te_, double Z) const {
+// ============================================================================
+// Coulomb logarithm (NRL Plasma Formulary, electron-ion). The two branches
+// cover the classical and quantum-dominated impact-parameter regimes; the
+// floor of 2 keeps cold/dense zones (where the formulary expressions go
+// negative and lose meaning) at a sane strongly-coupled value.
+// ============================================================================
+double Simulation::coulombLog(double electronDensity_percc, double temperature_eV,
+                              double ionCharge) const {
     if (deck_.conduction.ln_lambda > 0.0) return deck_.conduction.ln_lambda;
-    // NRL formulary electron-ion Coulomb logarithm, floored for cold/dense zones.
-    double ll;
-    if (Te_ > 10.0 * Z * Z)
-        ll = 24.0 - std::log(std::sqrt(ne) / Te_);
+    double lnLambda;
+    if (temperature_eV > 10.0 * ionCharge * ionCharge)
+        lnLambda = 24.0 - std::log(std::sqrt(electronDensity_percc) / temperature_eV);
     else
-        ll = 23.0 - std::log(std::sqrt(ne) * Z * std::pow(Te_, -1.5));
-    return std::max(ll, 2.0);
+        lnLambda = 23.0 - std::log(std::sqrt(electronDensity_percc) * ionCharge *
+                                   std::pow(temperature_eV, -1.5));
+    return std::max(lnLambda, 2.0);
 }
 
-// Equal-power ray impact parameters for the configured focal-spot profile:
-// each ray carries P/N when the b_k sit at the quantiles of the cumulative
-// power distribution C(b) = integral of 2*pi*b'*I(b') db'.
+// ============================================================================
+// Ray set: choose the impact parameters b_k so that every ray carries the
+// same power P(t)/N. That holds when the b_k sit at the quantiles of the
+// focal spot's cumulative power distribution
+//   C(b) = integral_0^b 2 pi b' I(b') db'.
+// Equal-power rays waste no resolution on dim parts of the spot and let the
+// trace treat every ray identically.
+// ============================================================================
 void Simulation::buildRaySet() {
-    const auto& L = deck_.laser;
-    const int N = L.rays;
-    rayB_.resize(N);
+    const auto& laser = deck_.laser;
+    const int rayCount = laser.rays;
+    rayImpactParameter_cm.resize(rayCount);
 
-    if (L.profile == "flattop") {
-        // C(b) ~ b^2: quantiles in closed form.
-        for (int k = 0; k < N; ++k)
-            rayB_[k] = L.beam_radius * std::sqrt((k + 0.5) / N);
+    if (laser.profile == "flattop") {
+        // Uniform intensity: C(b) ~ b^2, so the quantiles are closed-form.
+        for (int k = 0; k < rayCount; ++k)
+            rayImpactParameter_cm[k] =
+                laser.beam_radius * std::sqrt((k + 0.5) / rayCount);
         return;
     }
 
-    // Radial intensity profile I(b) (relative units) and its outer edge.
-    double bmax;
-    std::function<double(double)> I;
-    if (L.profile == "table") {
-        const auto& tab = L.profile_table;
-        bmax = tab.back().first;
-        I = [&tab](double b) {
-            if (b < tab.front().first || b > tab.back().first) return 0.0;
-            return interpTimeTable(tab, b);
+    // Radial intensity profile I(b) in relative units, and the outer radius
+    // beyond which it is treated as zero.
+    double maxImpact_cm;
+    std::function<double(double)> intensityProfile;
+    if (laser.profile == "table") {
+        const auto& table = laser.profile_table;
+        maxImpact_cm = table.back().first;
+        intensityProfile = [&table](double b_cm) {
+            // Zero outside the tabulated range: a first radius > 0 therefore
+            // produces an annular beam.
+            if (b_cm < table.front().first || b_cm > table.back().first) return 0.0;
+            return interpTimeTable(table, b_cm);
         };
-    } else {  // gaussian | supergaussian, truncated at I/I0 = 1e-4
-        const double n = (L.profile == "gaussian") ? 2.0 : L.sg_order;
-        const double w = L.beam_radius;
-        bmax = w * std::pow(std::log(1e4), 1.0 / n);
-        I = [n, w](double b) { return std::exp(-std::pow(b / w, n)); };
+    } else {  // gaussian | supergaussian, truncated where I/I0 = 1e-4
+        const double order = (laser.profile == "gaussian") ? 2.0 : laser.sg_order;
+        const double eFoldRadius_cm = laser.beam_radius;
+        maxImpact_cm = eFoldRadius_cm * std::pow(std::log(1e4), 1.0 / order);
+        intensityProfile = [order, eFoldRadius_cm](double b_cm) {
+            return std::exp(-std::pow(b_cm / eFoldRadius_cm, order));
+        };
     }
 
-    // Cumulative power on a fine grid (trapezoid), then invert quantiles.
-    const int NG = 8192;
-    std::vector<double> bg(NG + 1), C(NG + 1);
-    for (int i = 0; i <= NG; ++i) bg[i] = bmax * i / NG;
-    C[0] = 0.0;
-    for (int i = 1; i <= NG; ++i) {
-        const double f0 = bg[i - 1] * I(bg[i - 1]);
-        const double f1 = bg[i] * I(bg[i]);
-        C[i] = C[i - 1] + 0.5 * (f0 + f1) * (bg[i] - bg[i - 1]);
+    // Build C(b) on a fine grid by the trapezoid rule, then invert each
+    // quantile by linear interpolation.
+    const int gridCount = 8192;
+    std::vector<double> bGrid_cm(gridCount + 1), cumulativePower(gridCount + 1);
+    for (int i = 0; i <= gridCount; ++i)
+        bGrid_cm[i] = maxImpact_cm * i / gridCount;
+    cumulativePower[0] = 0.0;
+    for (int i = 1; i <= gridCount; ++i) {
+        const double f0 = bGrid_cm[i - 1] * intensityProfile(bGrid_cm[i - 1]);
+        const double f1 = bGrid_cm[i] * intensityProfile(bGrid_cm[i]);
+        cumulativePower[i] =
+            cumulativePower[i - 1] + 0.5 * (f0 + f1) * (bGrid_cm[i] - bGrid_cm[i - 1]);
     }
-    if (C[NG] <= 0.0)
+    if (cumulativePower[gridCount] <= 0.0)
         throw std::runtime_error("laser: focal-spot profile carries no power");
-    for (int k = 0; k < N; ++k) {
-        const double target = (k + 0.5) / N * C[NG];
-        const auto it = std::lower_bound(C.begin(), C.end(), target);
-        const size_t i = std::max<size_t>(1, it - C.begin());
-        const double wgt = (target - C[i - 1]) / std::max(C[i] - C[i - 1], 1e-300);
-        rayB_[k] = bg[i - 1] + wgt * (bg[i] - bg[i - 1]);
+    for (int k = 0; k < rayCount; ++k) {
+        const double target = (k + 0.5) / rayCount * cumulativePower[gridCount];
+        const auto it =
+            std::lower_bound(cumulativePower.begin(), cumulativePower.end(), target);
+        const size_t i = std::max<size_t>(1, it - cumulativePower.begin());
+        const double weight = (target - cumulativePower[i - 1]) /
+                              std::max(cumulativePower[i] - cumulativePower[i - 1],
+                                       1e-300);
+        rayImpactParameter_cm[k] =
+            bGrid_cm[i - 1] + weight * (bGrid_cm[i] - bGrid_cm[i - 1]);
     }
 }
 
-// Spherically symmetric laser ray trace with refraction. Uniform ("infinite
-// beam") illumination reduces, in 1D, to a bundle of rays sampling the focal
-// spot's impact parameter b, distributed per the spot's radial intensity
-// profile (see buildRaySet). Each ray obeys Bouguer's law
-// mu(r) r sin(theta) = b in the spherically stratified plasma, so within a
-// zone of constant refractive index mu_j = sqrt(1 - ne/nc) it is a straight
-// chord with distance of closest approach d = b/mu_j. Rays refract, turn at
-// d (or reflect at the critical surface / a total-internal-reflection
-// interface), and retrace the mirrored path outward. Inverse-bremsstrahlung
-// absorption attenuates the ray along each chord and the loss is deposited
-// in the traversed zone (into the electrons in 2T mode). A user-set fraction
-// of the power reaching the critical surface is dumped there as a
-// resonance-absorption stand-in.
-void Simulation::laserStep(double dt) {
-    if (!laser_) return;
-    const auto& L = deck_.laser;
-    const double Pt = L.powerAt(t);
-    fabs_ = 0.0;
+// ============================================================================
+// Laser ray trace with refraction and inverse-bremsstrahlung absorption.
+//
+// GEOMETRY: uniform illumination from "infinitely many beams" reduces, in
+// spherical symmetry, to a bundle of rays labeled by impact parameter b.
+// Each ray obeys Bouguer's law (the spherical Snell's law)
+//     mu(r) * r * sin(theta) = b        (b defined in vacuum where mu = 1)
+// with refractive index mu = sqrt(1 - ne/n_crit). Within a zone of constant
+// mu the ray is a straight chord whose distance of closest approach to the
+// origin is d = b/mu. Walking inward zone by zone, a ray either:
+//   - crosses the zone (d < inner radius): chord length from geometry;
+//   - turns inside the zone (d >= inner radius): reaches depth d and comes
+//     back out through the same zone;
+//   - reflects at a zone face where mu drops enough that b/mu >= face radius
+//     (total internal reflection), or where the zone is overdense
+//     (ne >= n_crit, the critical surface).
+// The outward path is the exact mirror of the inward path, so the ray
+// retraces its chord list in reverse.
+//
+// ABSORPTION: along each chord the power decays as exp(-kappa_IB * length)
+// with the inverse-bremsstrahlung coefficient
+//     kappa_IB = nu_ei * (ne/n_crit) / (c * mu)          [1/cm]
+// (nu_ei = NRL electron-ion collision frequency). Absorbed power is
+// deposited in the traversed zone's electrons. A user-set fraction of any
+// power reaching the critical surface is dumped there -- a stand-in for
+// resonance absorption that also bootstraps coupling on a cold solid target
+// before an underdense corona exists.
+//
+// LANGDON EFFECT: strong IB heating distorts the electron distribution away
+// from Maxwellian (toward a super-Gaussian), which reduces the absorption.
+// We apply the standard fit to Langdon's result (PRL 44, 575 (1980)):
+//     kappa *= 1 - 0.553 / (1 + (0.27/alpha)^0.75),
+//     alpha = Zbar * v_osc^2 / v_te^2,
+// where v_osc is the electron quiver velocity in the laser field. The local
+// intensity needed for v_osc is gathered from the trace itself (each chord
+// contributes remaining ray power over its oblique tube cross-section) and
+// used one step lagged -- the intensity field evolves far more slowly than
+// the hydro time step, so the lag is harmless.
+// ============================================================================
+void Simulation::laserStep(double dt_s) {
+    if (!laserOn_) return;
+    const auto& laser = deck_.laser;
+    const double totalPower_ergs = laser.powerAt(time_s);
+    laserAbsorbedFraction_ = 0.0;
     rayDiag_.clear();
-    if (Pt <= 0.0) {
-        Ilas_.assign(M, 0.0);
+    if (totalPower_ergs <= 0.0) {
+        laserIntensity_ergcm2s.assign(numZones_, 0.0);
         return;
     }
-    ElaserInc += Pt * dt;
+    laserIncident_erg += totalPower_ergs * dt_s;
 
-    // Zone optics from the beginning-of-step state.
-    if (Ilas_.empty()) Ilas_.assign(M, 0.0);
-    const double lamCm = L.wavelength_um * 1e-4;
-    // v_osc^2 = 2 e^2 I lambda^2 / (pi me^2 c^3) (linear polarization).
-    const double voscCoef = 2.0 * phys::e_esu * phys::e_esu * lamCm * lamCm /
-                            (phys::pi * phys::m_e * phys::m_e *
-                             phys::c_light * phys::c_light * phys::c_light);
-    std::vector<double> mu(M), kap(M);
+    // ---- per-zone optics (refractive index, absorption coefficient) ----------
+    if (laserIntensity_ergcm2s.empty()) laserIntensity_ergcm2s.assign(numZones_, 0.0);
+    const double wavelength_cm = laser.wavelength_um * 1e-4;
+    // Quiver-velocity coefficient: v_osc^2 = voscCoef * I  with I in
+    // erg/cm^2/s. Derivation (linear polarization, time-averaged):
+    //   I = (c/8pi) E^2,  v_osc = eE/(me omega),  omega = 2 pi c / lambda
+    //   =>  v_osc^2 = 2 e^2 lambda^2 I / (pi me^2 c^3).
+    const double voscCoef = 2.0 * phys::e_esu * phys::e_esu * wavelength_cm *
+                            wavelength_cm /
+                            (phys::pi * phys::m_e * phys::m_e * phys::c_light *
+                             phys::c_light * phys::c_light);
+    std::vector<double> refractiveIndex(numZones_), ibCoefficient_percm(numZones_);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        const double Tel = twoT_ ? Te[k] : T[k];
-        const double ne = rho[k] * zb[k] / (m.A * phys::m_p);
-        const double x = ne / ncrit_;
-        if (x < 1.0) {
-            mu[k] = std::sqrt(1.0 - x);
-            // Inverse bremsstrahlung: kappa = nu_ei (ne/nc) / (c mu), with the
-            // NRL electron-ion collision frequency.
-            const double Zeff = std::max(zb[k], 1.0);
-            const double lnL = coulombLog(ne, Tel, Zeff);
-            const double nu = 2.91e-6 * Zeff * ne * lnL / std::pow(Tel, 1.5);
-            kap[k] = nu * x / (phys::c_light * mu[k]);
-            // Langdon effect: IB heating distorts the electron distribution
-            // toward a super-Gaussian, reducing absorption. Standard fit to
-            // Langdon (PRL 44, 575 (1980)):
-            //   R = 1 - 0.553 / (1 + (0.27/alpha)^0.75),
-            //   alpha = Zbar v_osc^2 / v_te^2,
-            // evaluated with the local intensity from the previous step's trace.
-            if (L.langdon && Ilas_[k] > 0.0) {
-                const double vte2 = Tel * phys::eV / phys::m_e;
-                const double alpha = Zeff * voscCoef * Ilas_[k] / vte2;
-                if (alpha > 1e-4)
-                    kap[k] *= 1.0 - 0.553 / (1.0 + std::pow(0.27 / alpha, 0.75));
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        const double electronTemp_eV =
+            twoTemperature_ ? electronTemperature_eV[k] : zoneTemperature_eV[k];
+        const double electronDensity_percc =
+            zoneDensity_gcc[k] * zoneMeanIonization[k] / (material.A * phys::m_p);
+        const double densityRatio = electronDensity_percc / criticalElectronDensity_percc;
+        if (densityRatio < 1.0) {
+            refractiveIndex[k] = std::sqrt(1.0 - densityRatio);
+            const double effectiveCharge = std::max(zoneMeanIonization[k], 1.0);
+            const double lnLambda =
+                coulombLog(electronDensity_percc, electronTemp_eV, effectiveCharge);
+            // NRL electron-ion collision frequency [1/s].
+            const double collisionFrequency_pers =
+                2.91e-6 * effectiveCharge * electronDensity_percc * lnLambda /
+                std::pow(electronTemp_eV, 1.5);
+            ibCoefficient_percm[k] = collisionFrequency_pers * densityRatio /
+                                     (phys::c_light * refractiveIndex[k]);
+            // Langdon reduction (see header comment), using the lagged local
+            // intensity. Skipped when alpha is negligible.
+            if (laser.langdon && laserIntensity_ergcm2s[k] > 0.0) {
+                const double thermalSpeedSq_cm2s2 =
+                    electronTemp_eV * phys::eV / phys::m_e;
+                const double langdonAlpha = effectiveCharge * voscCoef *
+                                            laserIntensity_ergcm2s[k] /
+                                            thermalSpeedSq_cm2s2;
+                if (langdonAlpha > 1e-4)
+                    ibCoefficient_percm[k] *=
+                        1.0 - 0.553 / (1.0 + std::pow(0.27 / langdonAlpha, 0.75));
             }
         } else {
-            mu[k] = 0.0;   // overdense: reflects at this zone's outer face
-            kap[k] = 0.0;
+            refractiveIndex[k] = 0.0;  // overdense: reflects at outer face
+            ibCoefficient_percm[k] = 0.0;
         }
     }
-    std::vector<double> Inew(M, 0.0);  // local intensity gathered this trace
+    // Local intensity gathered during THIS trace, promoted to
+    // laserIntensity_ergcm2s at the end for next step's Langdon factor.
+    std::vector<double> gatheredIntensity_ergcm2s(numZones_, 0.0);
 
-    std::vector<double> dep(M, 0.0);
-    double absorbed = 0.0;
-    const int N = L.rays;
-    const double Pray = Pt / N;
+    std::vector<double> depositedPower_ergs(numZones_, 0.0);
+    double absorbedPower_ergs = 0.0;
+    const int rayCount = laser.rays;
+    const double rayPower_ergs = totalPower_ergs / rayCount;
 
-    struct Seg { int zone; double len; };
-    std::vector<Seg> segs;
-    for (int k = 0; k < N; ++k) {
-        const double b = rayB_[k];
-        if (b >= r[M]) {  // misses the plasma entirely
-            rayDiag_.push_back({b, b, 0.0});
+    // One chord of a ray's path: which zone it crosses and how long it is.
+    struct Chord {
+        int zone;
+        double length_cm;
+    };
+    std::vector<Chord> inwardPath;
+    for (int rayIdx = 0; rayIdx < rayCount; ++rayIdx) {
+        const double impactParameter_cm = rayImpactParameter_cm[rayIdx];
+        if (impactParameter_cm >= nodeRadius_cm[numZones_]) {
+            // The ray misses the plasma entirely (spot larger than target).
+            rayDiag_.push_back({impactParameter_cm, impactParameter_cm, 0.0});
             continue;
         }
-        // Inward walk from the outer boundary.
-        segs.clear();
-        bool turnedInShell = false;
-        int critZone = -1;
-        double rmin = r[0];
-        for (int j = M - 1; j >= 0; --j) {
-            const double rin = r[j], rout = r[j + 1];
-            if (mu[j] <= 0.0) {           // critical surface at this face
-                critZone = j;
-                rmin = rout;
+
+        // ---- inward walk from the outer boundary ----------------------------
+        inwardPath.clear();
+        bool turnedInsideZone = false;
+        int criticalSurfaceZone = -1;  // zone whose outer face reflected us
+        double turningRadius_cm = nodeRadius_cm[0];
+        for (int j = numZones_ - 1; j >= 0; --j) {
+            const double innerRadius_cm = nodeRadius_cm[j];
+            const double outerRadius_cm = nodeRadius_cm[j + 1];
+            if (refractiveIndex[j] <= 0.0) {
+                // Overdense zone: the ray reflects at its outer face (the
+                // discrete critical surface).
+                criticalSurfaceZone = j;
+                turningRadius_cm = outerRadius_cm;
                 break;
             }
-            const double d = b / mu[j];   // chord's closest approach
-            if (d >= rout) {              // total internal reflection at face
-                rmin = rout;
+            // Bouguer: the straight chord in this constant-mu zone passes
+            // the origin at distance d = b/mu.
+            const double closestApproach_cm =
+                impactParameter_cm / refractiveIndex[j];
+            if (closestApproach_cm >= outerRadius_cm) {
+                // sin(theta) would exceed 1 at the face: total internal
+                // reflection where the index drops across the interface.
+                turningRadius_cm = outerRadius_cm;
                 break;
             }
-            const double souter = std::sqrt(rout * rout - d * d);
-            if (d >= rin) {               // turns inside this shell
-                segs.push_back({j, 2.0 * souter});
-                rmin = d;
-                turnedInShell = true;
+            // Half-chord length from the outer face to closest approach.
+            const double halfChordAtOuter_cm =
+                std::sqrt(outerRadius_cm * outerRadius_cm -
+                          closestApproach_cm * closestApproach_cm);
+            if (closestApproach_cm >= innerRadius_cm) {
+                // The ray turns inside this zone: it travels to depth d and
+                // back out, so the full in-zone path is twice the half-chord.
+                inwardPath.push_back({j, 2.0 * halfChordAtOuter_cm});
+                turningRadius_cm = closestApproach_cm;
+                turnedInsideZone = true;
                 break;
             }
-            segs.push_back({j, souter - std::sqrt(rin * rin - d * d)});
-            // j == 0 and no turn: ray reaches the inner wall (r_min > 0)
-            // and reflects; rmin = r[0] already set.
+            // The ray crosses the zone: chord length is the difference of
+            // half-chords at the two faces.
+            inwardPath.push_back(
+                {j, halfChordAtOuter_cm -
+                        std::sqrt(innerRadius_cm * innerRadius_cm -
+                                  closestApproach_cm * closestApproach_cm)});
+            // If j reaches 0 without turning (possible only when r_min > 0),
+            // the ray hits the inner wall and reflects;
+            // turningRadius_cm = nodeRadius_cm[0] was preset above.
         }
 
-        // Attenuate: inward chords, optional critical dump, mirrored outward
-        // chords (the turning chord already covers both directions). Each
-        // traversal also gathers the local intensity (ray power over the
-        // oblique tube cross-section, cos(theta) floored near turning points)
-        // used by next step's Langdon correction.
-        double Prem = Pray;
-        auto traverse = [&](const Seg& s) {
-            const double rc = 0.5 * (r[s.zone] + r[s.zone + 1]);
-            const double st = (mu[s.zone] > 0.0) ? b / (mu[s.zone] * rc) : 1.0;
-            const double ct = std::max(std::sqrt(std::max(1.0 - st * st, 0.0)), 0.1);
-            Inew[s.zone] += Prem / (area(rc) * ct);
-            const double dP = Prem * (-std::expm1(-kap[s.zone] * s.len));
-            dep[s.zone] += dP;
-            Prem -= dP;
+        // ---- attenuate along the path ---------------------------------------
+        // Inward chords, then the optional critical-surface dump, then the
+        // mirrored outward chords (the turning chord, if any, already covers
+        // both directions so it is excluded from the reversed pass). Each
+        // traversal also gathers local intensity: remaining ray power over
+        // the ray tube's oblique cross-section area*cos(theta), with
+        // cos(theta) floored at 0.1 near turning points where the true
+        // intensity swelling is bounded by diffraction, not geometry.
+        double remainingPower_ergs = rayPower_ergs;
+        auto traverseChord = [&](const Chord& chord) {
+            const double zoneCenter_cm =
+                0.5 * (nodeRadius_cm[chord.zone] + nodeRadius_cm[chord.zone + 1]);
+            const double sinTheta =
+                (refractiveIndex[chord.zone] > 0.0)
+                    ? impactParameter_cm /
+                          (refractiveIndex[chord.zone] * zoneCenter_cm)
+                    : 1.0;
+            const double cosTheta = std::max(
+                std::sqrt(std::max(1.0 - sinTheta * sinTheta, 0.0)), 0.1);
+            gatheredIntensity_ergcm2s[chord.zone] +=
+                remainingPower_ergs / (faceArea(zoneCenter_cm) * cosTheta);
+            // expm1 keeps precision for optically thin chords (small tau).
+            const double absorbed_ergs =
+                remainingPower_ergs *
+                (-std::expm1(-ibCoefficient_percm[chord.zone] * chord.length_cm));
+            depositedPower_ergs[chord.zone] += absorbed_ergs;
+            remainingPower_ergs -= absorbed_ergs;
         };
-        for (const auto& s : segs) traverse(s);
-        if (critZone >= 0 && L.absorb_at_critical > 0.0) {
-            const double dP = Prem * L.absorb_at_critical;
-            dep[critZone] += dP;
-            Prem -= dP;
+        for (const auto& chord : inwardPath) traverseChord(chord);
+        if (criticalSurfaceZone >= 0 && laser.absorb_at_critical > 0.0) {
+            const double dumped_ergs = remainingPower_ergs * laser.absorb_at_critical;
+            depositedPower_ergs[criticalSurfaceZone] += dumped_ergs;
+            remainingPower_ergs -= dumped_ergs;
         }
-        const int nOut = static_cast<int>(segs.size()) - (turnedInShell ? 1 : 0);
-        for (int s = nOut - 1; s >= 0; --s) traverse(segs[s]);
-        absorbed += Pray - Prem;  // remainder escapes back out
-        rayDiag_.push_back({b, rmin, (Pray - Prem) / Pray});
+        const int outwardChordCount =
+            static_cast<int>(inwardPath.size()) - (turnedInsideZone ? 1 : 0);
+        for (int c = outwardChordCount - 1; c >= 0; --c) traverseChord(inwardPath[c]);
+
+        // Whatever survives the round trip escapes back out of the plasma.
+        absorbedPower_ergs += rayPower_ergs - remainingPower_ergs;
+        rayDiag_.push_back({impactParameter_cm, turningRadius_cm,
+                            (rayPower_ergs - remainingPower_ergs) / rayPower_ergs});
     }
 
-    fabs_ = absorbed / Pt;
-    Ilas_ = Inew;
-    if (dt <= 0.0) return;  // trace-only mode (rayTraceReport)
-    Elaser += absorbed * dt;
+    laserAbsorbedFraction_ = absorbedPower_ergs / totalPower_ergs;
+    laserIntensity_ergcm2s = gatheredIntensity_ergcm2s;
+    if (dt_s <= 0.0) return;  // trace-only mode (rayTraceReport)
+    laserAbsorbed_erg += absorbedPower_ergs * dt_s;
 
-    // Deposit into the electron (or 1T matter) energy.
+    // ---- deposit into the electron (or 1T total-matter) energy ----------------
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        if (dep[k] <= 0.0) continue;
-        const auto& m = mats_[matid[k]];
-        const double de = dep[k] * dt / dm[k];
-        if (twoT_) {
-            ee[k] += de;
-            Te[k] = m.ele->temperature(rho[k], ee[k], Te[k]);
+    for (int k = 0; k < numZones_; ++k) {
+        if (depositedPower_ergs[k] <= 0.0) continue;
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        const double specificEnergyAdded_ergg =
+            depositedPower_ergs[k] * dt_s / zoneMass_g[k];
+        if (twoTemperature_) {
+            electronSpecificEnergy_ergg[k] += specificEnergyAdded_ergg;
+            electronTemperature_eV[k] = material.ele->temperature(
+                zoneDensity_gcc[k], electronSpecificEnergy_ergg[k],
+                electronTemperature_eV[k]);
         } else {
-            e[k] += de;
-            T[k] = m.eos->temperature(rho[k], e[k], T[k]);
+            zoneSpecificEnergy_ergg[k] += specificEnergyAdded_ergg;
+            zoneTemperature_eV[k] = material.eos->temperature(
+                zoneDensity_gcc[k], zoneSpecificEnergy_ergg[k],
+                zoneTemperature_eV[k]);
         }
     }
 }
 
 void Simulation::rayTraceReport() {
-    laserStep(0.0);
+    laserStep(0.0);  // dt = 0: trace and record diagnostics, deposit nothing
     std::printf("# ray trace at t = %g s, P = %g erg/s, n_crit = %g cm^-3\n",
-                t, deck_.laser.powerAt(t), ncrit_);
+                time_s, deck_.laser.powerAt(time_s), criticalElectronDensity_percc);
     std::printf("# %12s %14s %14s\n", "b [cm]", "r_turn [cm]", "f_abs");
-    for (const auto& ri : rayDiag_)
-        std::printf("  %12.6e %14.6e %14.6e\n", ri.b, ri.rmin, ri.fabs);
-    std::printf("# total absorbed fraction = %.6f\n", fabs_);
+    for (const auto& ray : rayDiag_)
+        std::printf("  %12.6e %14.6e %14.6e\n", ray.impactParameter_cm,
+                    ray.turningRadius_cm, ray.absorbedFraction);
+    std::printf("# total absorbed fraction = %.6f\n", laserAbsorbedFraction_);
 }
 
-// Burn-off fusion diagnostics: Bosch-Hale DT and DD reaction rates from the
-// ion temperature, accumulated into yields and burn history. Nothing is fed
-// back -- no charged-particle heating and no reactant depletion -- so this
-// has zero effect on the hydrodynamics.
-void Simulation::burnStep(double dt) {
-    if (!burn_) return;
-    double pf = 0.0, yn_dt = 0.0, yn_dd = 0.0, tiw = 0.0, wsum = 0.0;
+// ============================================================================
+// Burn-off fusion diagnostics. Reaction rates use the Bosch-Hale Maxwellian
+// reactivities evaluated at the ION temperature:
+//   DT:   rate = nD * nT * <sv>_DT            [reactions / cm^3 / s]
+//   DD:   rate = (1/2) nD^2 * <sv>_branch     (1/2 avoids double-counting
+//                                              identical reactant pairs)
+// Yields, fusion energy, and the burn-weighted <Ti> are accumulated, and the
+// time of peak fusion power defines the burn bang time. NOTHING IS FED BACK:
+// no charged-particle heating, no reactant depletion -- so running with burn
+// on or off gives bit-identical hydrodynamics.
+// ============================================================================
+void Simulation::burnStep(double dt_s) {
+    if (!burnOn_) return;
+    double stepFusionPower_ergs = 0.0, stepYieldDT = 0.0, stepYieldDDn = 0.0;
+    double stepWeightedTi_keV = 0.0, stepWeight = 0.0;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) \
-    reduction(+ : pf, yn_dt, yn_dd, tiw, wsum)
+    reduction(+ : stepFusionPower_ergs, stepYieldDT, stepYieldDDn, \
+                  stepWeightedTi_keV, stepWeight)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        if (m.xD <= 0.0) continue;
-        const double TkeV = (twoT_ ? Ti[k] : T[k]) * 1e-3;
-        if (TkeV < 0.2) continue;
-        const double ni = rho[k] / (m.A * phys::m_p);
-        const double nD = m.xD * ni, nT = m.xT * ni;
-        const double V = volume(r[k], r[k + 1]);
-        const double rDT = nD * nT * sigmavDT(TkeV);          // reactions/cm^3/s
-        const double rDDn = 0.5 * nD * nD * sigmavDDn(TkeV);
-        const double rDDp = 0.5 * nD * nD * sigmavDDp(TkeV);
-        pf += (rDT * fusion::Q_DT + rDDn * fusion::Q_DDn + rDDp * fusion::Q_DDp) * V;
-        yn_dt += rDT * V * dt;
-        yn_dd += rDDn * V * dt;
-        const double w = rDT * V * dt;
-        tiw += w * TkeV;
-        wsum += w;
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        if (material.xD <= 0.0) continue;
+        const double ionTemp_keV =
+            (twoTemperature_ ? ionTemperature_eV[k] : zoneTemperature_eV[k]) * 1e-3;
+        // Below 0.2 keV the reactivity is beyond the fit's range and utterly
+        // negligible (exponentially suppressed) -- skip the pow/exp work.
+        if (ionTemp_keV < 0.2) continue;
+        const double ionDensity_percc =
+            zoneDensity_gcc[k] / (material.A * phys::m_p);
+        const double deuteronDensity_percc = material.xD * ionDensity_percc;
+        const double tritonDensity_percc = material.xT * ionDensity_percc;
+        const double zoneVolume_cc =
+            shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
+        const double rateDT_perccps =
+            deuteronDensity_percc * tritonDensity_percc * sigmavDT(ionTemp_keV);
+        const double rateDDn_perccps = 0.5 * deuteronDensity_percc *
+                                       deuteronDensity_percc * sigmavDDn(ionTemp_keV);
+        const double rateDDp_perccps = 0.5 * deuteronDensity_percc *
+                                       deuteronDensity_percc * sigmavDDp(ionTemp_keV);
+        stepFusionPower_ergs +=
+            (rateDT_perccps * fusion::Q_DT + rateDDn_perccps * fusion::Q_DDn +
+             rateDDp_perccps * fusion::Q_DDp) *
+            zoneVolume_cc;
+        stepYieldDT += rateDT_perccps * zoneVolume_cc * dt_s;
+        stepYieldDDn += rateDDn_perccps * zoneVolume_cc * dt_s;
+        // Burn-weighted ion temperature: weight each zone's Ti by its DT
+        // reactions this step (that is what an activation diagnostic sees).
+        const double weight = rateDT_perccps * zoneVolume_cc * dt_s;
+        stepWeightedTi_keV += weight * ionTemp_keV;
+        stepWeight += weight;
     }
-    Pfus = pf;
-    YnDT += yn_dt;
-    YnDD += yn_dd;
-    Efus += pf * dt;
-    burnTiSum += tiw;
-    burnWSum += wsum;
-    if (pf > PfusMax) {
-        PfusMax = pf;
-        tBangBurn = t;
+    fusionPower_ergs = stepFusionPower_ergs;
+    neutronYieldDT += stepYieldDT;
+    neutronYieldDDn += stepYieldDDn;
+    fusionEnergy_erg += stepFusionPower_ergs * dt_s;
+    burnWeightedTiSum_keV += stepWeightedTi_keV;
+    burnWeightSum += stepWeight;
+    if (stepFusionPower_ergs > peakFusionPower_ergs) {
+        peakFusionPower_ergs = stepFusionPower_ergs;
+        fusionBangTime_s = time_s;
     }
 }
 
-void Simulation::couplingStep(double dt) {
-    if (!twoT_) return;
+// ============================================================================
+// Electron-ion temperature relaxation (2T only). The NRL-formulary
+// equilibration rate
+//   dTe/dt = nu_eq (Ti - Te),
+//   nu_eq = 1.8e-19 sqrt(me mi) Z^2 ni lnLambda / (me Ti + mi Te)^{3/2}
+// (masses in g, T in eV, n in cm^-3, nu in 1/s) is integrated pointwise with
+// backward Euler: solving the coupled two-temperature relaxation implicitly
+// gives the exact bounded update
+//   (Ti - Te)^{new} = (Ti - Te) / (1 + q (1/cv_i + 1/cv_e)),
+// which is unconditionally stable no matter how stiff the coupling (e.g. in
+// cold dense matter where nu_eq is enormous). The energy exchanged is applied
+// antisymmetrically, so the pair conserves energy to machine precision.
+// ============================================================================
+void Simulation::couplingStep(double dt_s) {
+    if (!twoTemperature_) return;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        const double mi = m.A * phys::m_p;
-        const double ni = rho[k] / mi;
-        const double ne = ni * zb[k];
-        const double Zeff = std::max(zb[k], 1.0);
-        const double lnL = coulombLog(ne, Te[k], Zeff);
-        // NRL formulary electron-ion temperature equilibration rate:
-        // dTe/dt = nu (Ti - Te), nu in s^-1 with m in g, T in eV, n in cm^-3.
-        const double nu = 1.8e-19 * std::sqrt(phys::m_e * mi) * zb[k] * zb[k] * ni *
-                          lnL / std::pow(phys::m_e * Ti[k] + mi * Te[k], 1.5);
-        // Backward-Euler pointwise solve of the two-temperature relaxation.
-        const double qm = dt * 1.5 * ne * phys::eV * nu / rho[k];  // erg/g/eV
-        const double cvi = std::max(m.ion->cv(rho[k], Ti[k]), 1e-30);
-        const double cve = std::max(m.ele->cv(rho[k], Te[k]), 1e-30);
-        const double dT = (Ti[k] - Te[k]) / (1.0 + qm * (1.0 / cvi + 1.0 / cve));
-        const double Q = qm * dT;  // specific energy moved ion -> electron
-        ee[k] += Q;
-        ei[k] -= Q;
-        Te[k] = m.ele->temperature(rho[k], ee[k], Te[k]);
-        Ti[k] = m.ion->temperature(rho[k], ei[k], Ti[k]);
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        const double ionMass_g = material.A * phys::m_p;
+        const double ionDensity_percc = zoneDensity_gcc[k] / ionMass_g;
+        const double electronDensity_percc = ionDensity_percc * zoneMeanIonization[k];
+        const double effectiveCharge = std::max(zoneMeanIonization[k], 1.0);
+        const double lnLambda = coulombLog(electronDensity_percc,
+                                           electronTemperature_eV[k], effectiveCharge);
+        const double equilibrationRate_pers =
+            1.8e-19 * std::sqrt(phys::m_e * ionMass_g) * zoneMeanIonization[k] *
+            zoneMeanIonization[k] * ionDensity_percc * lnLambda /
+            std::pow(phys::m_e * ionTemperature_eV[k] +
+                         ionMass_g * electronTemperature_eV[k],
+                     1.5);
+        // q below is the coupling strength integrated over the step, per
+        // unit mass: [erg/g/eV]. (3/2) ne kB per unit volume is the electron
+        // heat capacity the formulary rate is defined against.
+        const double couplingStrength_erggeV = dt_s * 1.5 * electronDensity_percc *
+                                               phys::eV * equilibrationRate_pers /
+                                               zoneDensity_gcc[k];
+        const double ionHeatCapacity_erggeV =
+            std::max(material.ion->cv(zoneDensity_gcc[k], ionTemperature_eV[k]),
+                     1e-30);
+        const double electronHeatCapacity_erggeV =
+            std::max(material.ele->cv(zoneDensity_gcc[k], electronTemperature_eV[k]),
+                     1e-30);
+        const double newTemperatureGap_eV =
+            (ionTemperature_eV[k] - electronTemperature_eV[k]) /
+            (1.0 + couplingStrength_erggeV * (1.0 / ionHeatCapacity_erggeV +
+                                              1.0 / electronHeatCapacity_erggeV));
+        // Specific energy moved from ions to electrons this step.
+        const double exchangedEnergy_ergg =
+            couplingStrength_erggeV * newTemperatureGap_eV;
+        electronSpecificEnergy_ergg[k] += exchangedEnergy_ergg;
+        ionSpecificEnergy_ergg[k] -= exchangedEnergy_ergg;
+        electronTemperature_eV[k] = material.ele->temperature(
+            zoneDensity_gcc[k], electronSpecificEnergy_ergg[k],
+            electronTemperature_eV[k]);
+        ionTemperature_eV[k] = material.ion->temperature(
+            zoneDensity_gcc[k], ionSpecificEnergy_ergg[k], ionTemperature_eV[k]);
     }
 }
 
-double Simulation::zoneKappa(int j) const {
-    // Spitzer-Harm electron thermal conductivity, kappa in units such that
-    // flux = -kappa * d(kB*Te)/dr  [erg/cm^2/s], i.e. kappa in 1/(cm s):
-    //   kappa = gamma0(Z) * ne * kB*Te * tau_e / me
-    //   tau_e = 3.44e5 * Te[eV]^{3/2} / (ne * lnLambda)   [s]  (NRL formulary)
-    const auto& m = mats_[matid[j]];
-    const double Tel = twoT_ ? Te[j] : T[j];
-    const double ne = rho[j] * zb[j] / (m.A * phys::m_p);
-    const double Zeff = std::max(zb[j], 1.0);
-    const double lnL = coulombLog(ne, Tel, Zeff);
-    const double tau = 3.44e5 * std::pow(Tel, 1.5) / (ne * lnL);
-    return braginskiiGamma0(Zeff) * ne * (Tel * phys::eV) * tau / phys::m_e;
+// ============================================================================
+// Thermal conductivities. Both are expressed in units such that
+//   heat flux = -kappa * d(kB*T)/dr    [erg/cm^2/s],
+// i.e. kappa itself carries 1/(cm*s).
+// ============================================================================
+double Simulation::electronConductivity(int zone) const {
+    // Spitzer-Harm: kappa_e = gamma0(Z) * ne * kB*Te * tau_e / me with the
+    // NRL electron collision time tau_e = 3.44e5 Te^{3/2} / (ne lnLambda) [s]
+    // (Te in eV, ne in cm^-3).
+    const auto& material = materials_[zoneMaterialIndex[zone]];
+    const double electronTemp_eV =
+        twoTemperature_ ? electronTemperature_eV[zone] : zoneTemperature_eV[zone];
+    const double electronDensity_percc =
+        zoneDensity_gcc[zone] * zoneMeanIonization[zone] / (material.A * phys::m_p);
+    const double effectiveCharge = std::max(zoneMeanIonization[zone], 1.0);
+    const double lnLambda =
+        coulombLog(electronDensity_percc, electronTemp_eV, effectiveCharge);
+    const double collisionTime_s =
+        3.44e5 * std::pow(electronTemp_eV, 1.5) / (electronDensity_percc * lnLambda);
+    return braginskiiGamma0(effectiveCharge) * electronDensity_percc *
+           (electronTemp_eV * phys::eV) * collisionTime_s / phys::m_e;
 }
 
-double Simulation::zoneKappaIon(int j) const {
-    // Braginskii ion thermal conductivity (same flux convention as zoneKappa):
-    //   kappa_i = 3.9 * ni * kB*Ti * tau_i / mi
-    //   tau_i = 2.09e7 * sqrt(mu) * Ti[eV]^{3/2} / (Z^4 * ni * lnLambda)  [s]
-    // (NRL formulary ion collision time, mu = mi/mp).
-    const auto& m = mats_[matid[j]];
-    const double mi = m.A * phys::m_p;
-    const double ni = rho[j] / mi;
-    const double ne = ni * zb[j];
-    const double Zeff = std::max(zb[j], 1.0);
-    const double lnL = coulombLog(ne, Ti[j], Zeff);
-    const double tau = 2.09e7 * std::sqrt(m.A) * std::pow(Ti[j], 1.5) /
-                       (Zeff * Zeff * Zeff * Zeff * ni * lnL);
-    return 3.9 * ni * (Ti[j] * phys::eV) * tau / mi;
+double Simulation::ionConductivity(int zone) const {
+    // Braginskii: kappa_i = 3.9 * ni * kB*Ti * tau_i / mi with the NRL ion
+    // collision time tau_i = 2.09e7 sqrt(A) Ti^{3/2} / (Z^4 ni lnLambda) [s].
+    // Small next to the electron conductivity in equilibrium (sqrt(me/mi)),
+    // but essential where Ti >> Te -- e.g. smoothing the converging-shock
+    // ion-temperature spike at void closure.
+    const auto& material = materials_[zoneMaterialIndex[zone]];
+    const double ionMass_g = material.A * phys::m_p;
+    const double ionDensity_percc = zoneDensity_gcc[zone] / ionMass_g;
+    const double electronDensity_percc = ionDensity_percc * zoneMeanIonization[zone];
+    const double effectiveCharge = std::max(zoneMeanIonization[zone], 1.0);
+    const double lnLambda =
+        coulombLog(electronDensity_percc, ionTemperature_eV[zone], effectiveCharge);
+    const double collisionTime_s =
+        2.09e7 * std::sqrt(material.A) * std::pow(ionTemperature_eV[zone], 1.5) /
+        (effectiveCharge * effectiveCharge * effectiveCharge * effectiveCharge *
+         ionDensity_percc * lnLambda);
+    return 3.9 * ionDensity_percc * (ionTemperature_eV[zone] * phys::eV) *
+           collisionTime_s / ionMass_g;
 }
 
-void Simulation::conductionStep(double dt) {
-    if (!deck_.conduction.enabled || M < 2) return;
-    solveConduction(dt, /*ion=*/false);
-    if (twoT_ && deck_.conduction.ion_conduction) solveConduction(dt, /*ion=*/true);
+void Simulation::conductionStep(double dt_s) {
+    if (!deck_.conduction.enabled || numZones_ < 2) return;
+    solveConduction(dt_s, /*ionSpecies=*/false);  // electrons (or 1T matter)
+    if (twoTemperature_ && deck_.conduction.ion_conduction)
+        solveConduction(dt_s, /*ionSpecies=*/true);
 }
 
-// Flux-limited thermal conduction on one temperature field (electrons in 1T
-// and 2T mode; ions in 2T mode), backward Euler with a tridiagonal solve.
-void Simulation::solveConduction(double dt, bool ion) {
-    const double f = ion ? deck_.conduction.ion_flux_limiter
-                         : deck_.conduction.flux_limiter;
-    std::vector<double>& Tc = ion ? Ti : (twoT_ ? Te : T);
-    std::vector<double>& ec = ion ? ei : (twoT_ ? ee : e);
+// ============================================================================
+// Flux-limited thermal conduction on one temperature field, backward Euler
+// in time (so arbitrarily large diffusion numbers are stable -- Spitzer
+// conduction in a keV hot spot is far too stiff for explicit stepping).
+//
+// Spatial discretization: finite-volume on the zones. The conductance of the
+// face at node i between zones i-1 and i is
+//   G_i = kappa_face * A_i * kB / (rc_i - rc_{i-1})   [erg/s per eV of dT]
+// with kappa_face the HARMONIC mean of the zone conductivities (the correct
+// series-resistance average, which keeps fluxes sane across sharp material
+// interfaces where kappa jumps by orders of magnitude).
+//
+// Flux limiting: Spitzer-Harm is a small-gradient expansion; where the
+// temperature scale length approaches the collision mean free path it wildly
+// overpredicts the flux. The standard sharp limiter caps the flux against a
+// user-set fraction f of the free-streaming value:
+//   q = q_SH / (1 + |q_SH| / (f * n * kB*T * v_thermal)),
+// applied by scaling the face conductivity, evaluated with beginning-of-step
+// temperatures (frozen-coefficient linearization).
+//
+// Energy update: the SOLVED temperature field defines the face fluxes, and
+// zone energies change by the flux divergence. Because each face's flux
+// enters its two neighbors with opposite signs, total energy is conserved to
+// round-off even when e(T) is nonlinear (TF ionization, degeneracy) -- which
+// a naive per-zone e(T_new) - e(T_old) update would not guarantee.
+// Temperatures are then re-inverted from the updated energies.
+// ============================================================================
+void Simulation::solveConduction(double dt_s, bool ionSpecies) {
+    const double fluxLimiter = ionSpecies ? deck_.conduction.ion_flux_limiter
+                                          : deck_.conduction.flux_limiter;
+    std::vector<double>& temperature_eV =
+        ionSpecies ? ionTemperature_eV
+                   : (twoTemperature_ ? electronTemperature_eV : zoneTemperature_eV);
+    std::vector<double>& specificEnergy_ergg =
+        ionSpecies ? ionSpecificEnergy_ergg
+                   : (twoTemperature_ ? electronSpecificEnergy_ergg
+                                      : zoneSpecificEnergy_ergg);
 
-    // Zone centers, heat capacities, conductivities, free-streaming fluxes.
-    std::vector<double> rc(M), cv(M), kap(M), qf(M);
+    // ---- per-zone coefficients -------------------------------------------------
+    std::vector<double> zoneCenter_cm(numZones_), heatCapacity_erggeV(numZones_);
+    std::vector<double> conductivity_percms(numZones_);
+    std::vector<double> ionFreeStreamFlux_ergcm2s(numZones_);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        rc[k] = 0.5 * (r[k] + r[k + 1]);
-        cv[k] = std::max(ion ? m.ion->cv(rho[k], Tc[k])
-                             : (twoT_ ? m.ele->cv(rho[k], Tc[k])
-                                      : m.eos->cv(rho[k], Tc[k])), 1e-30);
-        kap[k] = ion ? zoneKappaIon(k) : zoneKappa(k);
-        if (ion) {
-            const double mi = m.A * phys::m_p;
-            const double ni = rho[k] / mi;
-            const double kT = Tc[k] * phys::eV;
-            qf[k] = f * ni * kT * std::sqrt(kT / mi);
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        zoneCenter_cm[k] = 0.5 * (nodeRadius_cm[k] + nodeRadius_cm[k + 1]);
+        heatCapacity_erggeV[k] = std::max(
+            ionSpecies
+                ? material.ion->cv(zoneDensity_gcc[k], temperature_eV[k])
+                : (twoTemperature_
+                       ? material.ele->cv(zoneDensity_gcc[k], temperature_eV[k])
+                       : material.eos->cv(zoneDensity_gcc[k], temperature_eV[k])),
+            1e-30);
+        conductivity_percms[k] =
+            ionSpecies ? ionConductivity(k) : electronConductivity(k);
+        if (ionSpecies) {
+            // Ion free-streaming flux is evaluated per zone because the ion
+            // mass differs between materials (unlike electrons).
+            const double ionMass_g = material.A * phys::m_p;
+            const double ionDensity_percc = zoneDensity_gcc[k] / ionMass_g;
+            const double thermalEnergy_erg = temperature_eV[k] * phys::eV;
+            ionFreeStreamFlux_ergcm2s[k] =
+                fluxLimiter * ionDensity_percc * thermalEnergy_erg *
+                std::sqrt(thermalEnergy_erg / ionMass_g);
         }
     }
 
-    // Face conductances G_i (erg/s/eV) at interior nodes i = 1..M-1, with the
-    // conductivity harmonically averaged across the face (correct behavior at
-    // material interfaces) and a sharp flux limiter:
-    //   q = q_SH / (1 + |q_SH| / (f * n * kB*T * v_th))
-    // evaluated with the beginning-of-step temperature field.
-    std::vector<double> G(M + 1, 0.0);
-    for (int i = 1; i < M; ++i) {
-        const int jl = i - 1, jr = i;
-        double kf = 0.0;
-        if (kap[jl] > 0.0 && kap[jr] > 0.0)
-            kf = 2.0 * kap[jl] * kap[jr] / (kap[jl] + kap[jr]);
-        const double drc = rc[jr] - rc[jl];
-        const double gradKT = (Tc[jr] - Tc[jl]) * phys::eV / drc;  // d(kB T)/dr
-        double qfs;
-        if (ion) {
-            qfs = 0.5 * (qf[jl] + qf[jr]);  // carrier mass varies by material
+    // ---- face conductances G_i [erg/s/eV] at interior nodes i = 1..M-1 ---------
+    std::vector<double> faceConductance_ergseV(numZones_ + 1, 0.0);
+    for (int i = 1; i < numZones_; ++i) {
+        const int zoneLeft = i - 1, zoneRight = i;
+        double harmonicKappa_percms = 0.0;
+        if (conductivity_percms[zoneLeft] > 0.0 && conductivity_percms[zoneRight] > 0.0)
+            harmonicKappa_percms =
+                2.0 * conductivity_percms[zoneLeft] * conductivity_percms[zoneRight] /
+                (conductivity_percms[zoneLeft] + conductivity_percms[zoneRight]);
+        const double centerSpacing_cm =
+            zoneCenter_cm[zoneRight] - zoneCenter_cm[zoneLeft];
+        // Temperature gradient in energy units, d(kB*T)/dr [erg/cm].
+        const double thermalGradient_ergcm =
+            (temperature_eV[zoneRight] - temperature_eV[zoneLeft]) * phys::eV /
+            centerSpacing_cm;
+        double freeStreamFlux_ergcm2s;
+        if (ionSpecies) {
+            freeStreamFlux_ergcm2s = 0.5 * (ionFreeStreamFlux_ergcm2s[zoneLeft] +
+                                            ionFreeStreamFlux_ergcm2s[zoneRight]);
         } else {
-            const auto& ml = mats_[matid[jl]];
-            const auto& mr = mats_[matid[jr]];
-            const double nef = 0.5 * (rho[jl] * zb[jl] / (ml.A * phys::m_p) +
-                                      rho[jr] * zb[jr] / (mr.A * phys::m_p));
-            const double kTf = 0.5 * (Tc[jl] + Tc[jr]) * phys::eV;
-            qfs = f * nef * kTf * std::sqrt(kTf / phys::m_e);
+            const auto& materialLeft = materials_[zoneMaterialIndex[zoneLeft]];
+            const auto& materialRight = materials_[zoneMaterialIndex[zoneRight]];
+            const double faceElectronDensity_percc =
+                0.5 * (zoneDensity_gcc[zoneLeft] * zoneMeanIonization[zoneLeft] /
+                           (materialLeft.A * phys::m_p) +
+                       zoneDensity_gcc[zoneRight] * zoneMeanIonization[zoneRight] /
+                           (materialRight.A * phys::m_p));
+            const double faceThermalEnergy_erg =
+                0.5 * (temperature_eV[zoneLeft] + temperature_eV[zoneRight]) *
+                phys::eV;
+            freeStreamFlux_ergcm2s = fluxLimiter * faceElectronDensity_percc *
+                                     faceThermalEnergy_erg *
+                                     std::sqrt(faceThermalEnergy_erg / phys::m_e);
         }
-        const double qsh = kf * std::abs(gradKT);
-        const double keff = (qfs > 0.0) ? kf / (1.0 + qsh / qfs) : kf;
-        G[i] = keff * area(r[i]) * phys::eV / drc;
+        const double spitzerFlux_ergcm2s =
+            harmonicKappa_percms * std::abs(thermalGradient_ergcm);
+        const double limitedKappa_percms =
+            (freeStreamFlux_ergcm2s > 0.0)
+                ? harmonicKappa_percms / (1.0 + spitzerFlux_ergcm2s /
+                                                    freeStreamFlux_ergcm2s)
+                : harmonicKappa_percms;
+        faceConductance_ergseV[i] = limitedKappa_percms *
+                                    faceArea(nodeRadius_cm[i]) * phys::eV /
+                                    centerSpacing_cm;
     }
+    // faceConductance_ergseV[0] and [numZones_] stay 0: insulated boundaries.
 
-    // Backward-Euler tridiagonal system for T^{n+1}.
-    std::vector<double> a(M), b(M), cc(M), d(M), Tn(M);
-    for (int k = 0; k < M; ++k) {
-        const double diag0 = dm[k] * cv[k] / dt;
-        a[k] = -G[k];
-        cc[k] = -G[k + 1];
-        b[k] = diag0 + G[k] + G[k + 1];
-        d[k] = diag0 * Tc[k];
+    // ---- backward-Euler tridiagonal system for T^{n+1} --------------------------
+    //   (m cv/dt + G_i + G_{i+1}) T_k - G_i T_{k-1} - G_{i+1} T_{k+1}
+    //       = (m cv/dt) T_k^n
+    std::vector<double> lower(numZones_), diag(numZones_), upper(numZones_),
+        rhs(numZones_), solvedTemperature_eV(numZones_);
+    for (int k = 0; k < numZones_; ++k) {
+        const double thermalInertia_ergseV =
+            zoneMass_g[k] * heatCapacity_erggeV[k] / dt_s;
+        lower[k] = -faceConductance_ergseV[k];
+        upper[k] = -faceConductance_ergseV[k + 1];
+        diag[k] = thermalInertia_ergseV + faceConductance_ergseV[k] +
+                  faceConductance_ergseV[k + 1];
+        rhs[k] = thermalInertia_ergseV * temperature_eV[k];
     }
-    thomasSolve(a, b, cc, d, Tn);
+    thomasSolve(lower, diag, upper, rhs, solvedTemperature_eV);
 
-    // Energy update in flux form: the solved temperature field defines the
-    // face fluxes, and zone energies change by their divergence. This is
-    // exactly conservative even when e(T) is nonlinear (TF ionization,
-    // degeneracy); temperatures are then re-inverted from the energies.
+    // ---- conservative (flux-form) energy update ---------------------------------
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const double fluxIn = (k > 0 ? G[k] * (Tn[k - 1] - Tn[k]) : 0.0) +
-                              (k < M - 1 ? G[k + 1] * (Tn[k + 1] - Tn[k]) : 0.0);
-        ec[k] += dt * fluxIn / dm[k];
-        Tc[k] = ion ? mats_[matid[k]].ion->temperature(rho[k], ec[k], Tn[k])
-                    : (twoT_ ? mats_[matid[k]].ele->temperature(rho[k], ec[k], Tn[k])
-                             : mats_[matid[k]].eos->temperature(rho[k], ec[k], Tn[k]));
+    for (int k = 0; k < numZones_; ++k) {
+        const double netHeatInflow_ergs =
+            (k > 0 ? faceConductance_ergseV[k] *
+                         (solvedTemperature_eV[k - 1] - solvedTemperature_eV[k])
+                   : 0.0) +
+            (k < numZones_ - 1
+                 ? faceConductance_ergseV[k + 1] *
+                       (solvedTemperature_eV[k + 1] - solvedTemperature_eV[k])
+                 : 0.0);
+        specificEnergy_ergg[k] += dt_s * netHeatInflow_ergs / zoneMass_g[k];
+        temperature_eV[k] =
+            ionSpecies
+                ? materials_[zoneMaterialIndex[k]].ion->temperature(
+                      zoneDensity_gcc[k], specificEnergy_ergg[k],
+                      solvedTemperature_eV[k])
+                : (twoTemperature_
+                       ? materials_[zoneMaterialIndex[k]].ele->temperature(
+                             zoneDensity_gcc[k], specificEnergy_ergg[k],
+                             solvedTemperature_eV[k])
+                       : materials_[zoneMaterialIndex[k]].eos->temperature(
+                             zoneDensity_gcc[k], specificEnergy_ergg[k],
+                             solvedTemperature_eV[k]));
     }
 }
 
-double Simulation::matterCv(int k) const {
-    const auto& m = mats_[matid[k]];
-    return std::max(twoT_ ? m.ele->cv(rho[k], Te[k])
-                          : m.eos->cv(rho[k], T[k]), 1e-30);
+// Heat capacity of the matter field the radiation exchanges energy with:
+// electrons in 2T mode, the whole matter in 1T mode. [erg/g/eV]
+double Simulation::matterHeatCapacity(int zone) const {
+    const auto& material = materials_[zoneMaterialIndex[zone]];
+    return std::max(
+        twoTemperature_
+            ? material.ele->cv(zoneDensity_gcc[zone], electronTemperature_eV[zone])
+            : material.eos->cv(zoneDensity_gcc[zone], zoneTemperature_eV[zone]),
+        1e-30);
 }
 
-void Simulation::radiationStep(double dt) {
-    if (!rad_) return;
-    std::vector<double>& Tm = twoT_ ? Te : T;   // matter temp coupled to radiation
-    std::vector<double>& em = twoT_ ? ee : e;
+// ============================================================================
+// Grey flux-limited radiation diffusion, operator-split and backward Euler.
+//
+// The radiation energy density Er [erg/cm^3] obeys
+//   dEr/dt = div( D grad Er ) + c kappa_P rho (a T^4 - Er)
+// with diffusion coefficient D = c lambda(R) / (kappa_R rho), where lambda
+// is the Levermore-Pomraning flux limiter (-> 1/3 in thick material, caps
+// the flux at c Er in transparent material).
+//
+// MATTER COUPLING: the emission term a T^4 is linearized about the current
+// matter temperature (T^4 -> T0^4 + 4 T0^3 dT) and the resulting implicit
+// matter response is folded into the Er equation as the factor
+//   fc = cv / (cv + 4 c kappa_P dt a T^3),
+// so a single tridiagonal solve in Er captures the stiff emission/absorption
+// exchange stably. The matter energy is then updated with EXACTLY the
+// linearized source used in the solve, so matter+radiation energy is
+// conserved to round-off.
+//
+// BOUNDARIES: zero-flux at both ends unless radiation.bc_outer = "vacuum",
+// which adds a Marshak leak F = chi Er at the outer face, with
+//   chi = (c/2) / (1 + 0.75 kappa_R rho dr)
+// interpolating between the transparent (c/2, isotropic escape) and
+// optically thick (diffusion-limited) limits. Leaked energy is tracked.
+// ============================================================================
+void Simulation::radiationStep(double dt_s) {
+    if (!radiationOn_) return;
+    // The matter temperature/energy the radiation couples to.
+    std::vector<double>& matterTemperature_eV =
+        twoTemperature_ ? electronTemperature_eV : zoneTemperature_eV;
+    std::vector<double>& matterEnergy_ergg =
+        twoTemperature_ ? electronSpecificEnergy_ergg : zoneSpecificEnergy_ergg;
 
-    // Zone data: volumes, centers, opacities, coupling factors.
-    std::vector<double> V(M), rc(M), kR(M), kP(M), fc(M), cvv(M);
+    // ---- per-zone coefficients --------------------------------------------------
+    std::vector<double> zoneVolume_cc(numZones_), zoneCenter_cm(numZones_);
+    std::vector<double> rosseland_cm2g(numZones_), planck_cm2g(numZones_);
+    std::vector<double> couplingFactor(numZones_), heatCapacity_erggeV(numZones_);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        V[k] = volume(r[k], r[k + 1]);
-        rc[k] = 0.5 * (r[k] + r[k + 1]);
-        kR[k] = std::max(m.opacity->rosseland(rho[k], Tm[k]), 1e-10);
-        kP[k] = std::max(m.opacity->planck(rho[k], Tm[k]), 0.0);
-        cvv[k] = matterCv(k);
-        // Linearized-emission reduction factor: with backward-Euler coupling
-        // to the matter, the effective source is fc * c*kP*rho*(a Tm^4 - Er).
-        const double beta = 4.0 * phys::c_light * kP[k] * dt * phys::a_rad *
-                            Tm[k] * Tm[k] * Tm[k];
-        fc[k] = cvv[k] / (cvv[k] + beta);
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        zoneVolume_cc[k] = shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
+        zoneCenter_cm[k] = 0.5 * (nodeRadius_cm[k] + nodeRadius_cm[k + 1]);
+        // The Rosseland floor keeps the diffusion coefficient finite in
+        // effectively transparent zones (the flux limiter does the real work
+        // there anyway).
+        rosseland_cm2g[k] = std::max(
+            material.opacity->rosseland(zoneDensity_gcc[k], matterTemperature_eV[k]),
+            1e-10);
+        planck_cm2g[k] = std::max(
+            material.opacity->planck(zoneDensity_gcc[k], matterTemperature_eV[k]),
+            0.0);
+        heatCapacity_erggeV[k] = matterHeatCapacity(k);
+        // Linearized-emission reduction factor fc (see header comment):
+        // beta is the matter temperature's stiffness against radiating,
+        // 4 c kappa_P dt a T^3, in the same units as cv.
+        const double beta_erggeV =
+            4.0 * phys::c_light * planck_cm2g[k] * dt_s * phys::a_rad *
+            matterTemperature_eV[k] * matterTemperature_eV[k] *
+            matterTemperature_eV[k];
+        couplingFactor[k] =
+            heatCapacity_erggeV[k] / (heatCapacity_erggeV[k] + beta_erggeV);
     }
 
-    // Face diffusion conductances (erg s^-1 per erg cm^-3 of Er difference)
-    // with the Levermore-Pomraning flux limiter on the lagged field.
-    std::vector<double> G(M + 1, 0.0);
-    for (int i = 1; i < M; ++i) {
-        const int jl = i - 1, jr = i;
-        const double drc = rc[jr] - rc[jl];
-        const double krf = 0.5 * (kR[jl] * rho[jl] + kR[jr] * rho[jr]);  // 1/cm
-        const double Ef = std::max(0.5 * (Er[jl] + Er[jr]), 1e-300);
-        const double R = std::abs(Er[jr] - Er[jl]) / (drc * krf * Ef);
-        const double D = phys::c_light * lpLambda(R) / krf;  // cm^2/s
-        G[i] = D * area(r[i]) / drc;
+    // ---- face diffusion conductances [cm^3/s] -----------------------------------
+    // G_i converts an Er difference [erg/cm^3] into an energy flow [erg/s].
+    std::vector<double> faceConductance_ccs(numZones_ + 1, 0.0);
+    for (int i = 1; i < numZones_; ++i) {
+        const int zoneLeft = i - 1, zoneRight = i;
+        const double centerSpacing_cm =
+            zoneCenter_cm[zoneRight] - zoneCenter_cm[zoneLeft];
+        // Face inverse mean free path kappa_R * rho [1/cm].
+        const double faceInverseMfp_percm =
+            0.5 * (rosseland_cm2g[zoneLeft] * zoneDensity_gcc[zoneLeft] +
+                   rosseland_cm2g[zoneRight] * zoneDensity_gcc[zoneRight]);
+        const double faceEr_ergcc =
+            std::max(0.5 * (radiationEnergyDensity_ergcc[zoneLeft] +
+                            radiationEnergyDensity_ergcc[zoneRight]),
+                     1e-300);
+        // Levermore-Pomraning knudsen-like parameter R = |grad Er|/(kr rho Er),
+        // evaluated with the lagged (beginning-of-step) field.
+        const double gradientParameter =
+            std::abs(radiationEnergyDensity_ergcc[zoneRight] -
+                     radiationEnergyDensity_ergcc[zoneLeft]) /
+            (centerSpacing_cm * faceInverseMfp_percm * faceEr_ergcc);
+        const double diffusionCoefficient_cm2s =
+            phys::c_light * levermorePomraningLambda(gradientParameter) /
+            faceInverseMfp_percm;
+        faceConductance_ccs[i] =
+            diffusionCoefficient_cm2s * faceArea(nodeRadius_cm[i]) / centerSpacing_cm;
     }
 
-    // Backward-Euler tridiagonal solve for Er^{n+1}.
-    std::vector<double> a(M), b(M), cc(M), d(M), En(M);
-    for (int k = 0; k < M; ++k) {
-        const double diag0 = V[k] / dt;
-        const double S = V[k] * phys::c_light * kP[k] * rho[k] * fc[k];
-        const double aT4 = phys::a_rad * Tm[k] * Tm[k] * Tm[k] * Tm[k];
-        a[k] = -G[k];
-        cc[k] = -G[k + 1];
-        b[k] = diag0 + G[k] + G[k + 1] + S;
-        d[k] = diag0 * Er[k] + S * aT4;
+    // ---- backward-Euler tridiagonal solve for Er^{n+1} ---------------------------
+    std::vector<double> lower(numZones_), diag(numZones_), upper(numZones_),
+        rhs(numZones_), solvedEr_ergcc(numZones_);
+    for (int k = 0; k < numZones_; ++k) {
+        const double volumeOverDt_ccs = zoneVolume_cc[k] / dt_s;
+        // Effective emission/absorption coupling strength [cm^3/s].
+        const double sourceStrength_ccs = zoneVolume_cc[k] * phys::c_light *
+                                          planck_cm2g[k] * zoneDensity_gcc[k] *
+                                          couplingFactor[k];
+        const double equilibriumEr_ergcc =
+            phys::a_rad * matterTemperature_eV[k] * matterTemperature_eV[k] *
+            matterTemperature_eV[k] * matterTemperature_eV[k];
+        lower[k] = -faceConductance_ccs[k];
+        upper[k] = -faceConductance_ccs[k + 1];
+        diag[k] = volumeOverDt_ccs + faceConductance_ccs[k] +
+                  faceConductance_ccs[k + 1] + sourceStrength_ccs;
+        rhs[k] = volumeOverDt_ccs * radiationEnergyDensity_ergcc[k] +
+                 sourceStrength_ccs * equilibriumEr_ergcc;
     }
-    // Vacuum (Marshak) leakage through the outer boundary: F = chi * Er with
-    // chi interpolating the transparent (c/2) and optically thick limits.
-    double chiA = 0.0;
+    // Vacuum (Marshak) leakage through the outer boundary, added implicitly
+    // to the last zone's diagonal so the leak is evaluated at Er^{n+1}.
+    double leakConductance_ccs = 0.0;
     if (deck_.radiation.bc_outer == "vacuum") {
-        const double drl = r[M] - r[M - 1];
-        const double chi = 0.5 * phys::c_light /
-                           (1.0 + 0.75 * kR[M - 1] * rho[M - 1] * drl);
-        chiA = chi * area(r[M]);
-        b[M - 1] += chiA;
+        const double lastZoneWidth_cm =
+            nodeRadius_cm[numZones_] - nodeRadius_cm[numZones_ - 1];
+        const double leakSpeed_cmps =
+            0.5 * phys::c_light /
+            (1.0 + 0.75 * rosseland_cm2g[numZones_ - 1] *
+                       zoneDensity_gcc[numZones_ - 1] * lastZoneWidth_cm);
+        leakConductance_ccs = leakSpeed_cmps * faceArea(nodeRadius_cm[numZones_]);
+        diag[numZones_ - 1] += leakConductance_ccs;
     }
-    thomasSolve(a, b, cc, d, En);
+    thomasSolve(lower, diag, upper, rhs, solvedEr_ergcc);
 
-    if (chiA > 0.0) Eleak += chiA * En[M - 1] * dt;
+    if (leakConductance_ccs > 0.0)
+        radiationLeaked_erg += leakConductance_ccs * solvedEr_ergcc[numZones_ - 1] *
+                               dt_s;
 
-    // Couple absorbed/emitted energy back to the matter (exactly the
-    // linearized source used in the solve, so the exchange conserves energy).
+    // ---- couple the exchanged energy back to the matter --------------------------
+    // dTm below is EXACTLY the linearized response assumed in the solve, so
+    // the matter gains precisely what the radiation lost (and vice versa).
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int k = 0; k < M; ++k) {
-        const double aT4 = phys::a_rad * Tm[k] * Tm[k] * Tm[k] * Tm[k];
-        const double dTm = phys::c_light * kP[k] * dt * fc[k] * (En[k] - aT4) / cvv[k];
-        em[k] += cvv[k] * dTm;
-        Tm[k] += dTm;
-        Er[k] = En[k];
+    for (int k = 0; k < numZones_; ++k) {
+        const double equilibriumEr_ergcc =
+            phys::a_rad * matterTemperature_eV[k] * matterTemperature_eV[k] *
+            matterTemperature_eV[k] * matterTemperature_eV[k];
+        const double matterTemperatureChange_eV =
+            phys::c_light * planck_cm2g[k] * dt_s * couplingFactor[k] *
+            (solvedEr_ergcc[k] - equilibriumEr_ergcc) / heatCapacity_erggeV[k];
+        matterEnergy_ergg[k] += heatCapacity_erggeV[k] * matterTemperatureChange_eV;
+        matterTemperature_eV[k] += matterTemperatureChange_eV;
+        radiationEnergyDensity_ergcc[k] = solvedEr_ergcc[k];
     }
 }
 
+// ============================================================================
+// Output: zone-by-zone snapshots, the per-step history file, and the
+// end-of-run shot report.
+// ============================================================================
 void Simulation::writeSnapshot(int index) const {
-    char name[64];
-    std::snprintf(name, sizeof(name), "snap_%05d.csv", index);
-    std::ofstream out(std::filesystem::path(deck_.output.directory) / name);
-    out << "# t = " << t << " s, step = " << step << "\n";
+    char filename[64];
+    std::snprintf(filename, sizeof(filename), "snap_%05d.csv", index);
+    std::ofstream out(std::filesystem::path(deck_.output.directory) / filename);
+    out << "# t = " << time_s << " s, step = " << stepCount_ << "\n";
     out << "zone,material,r_left,r_right,r_center,u_left,u_right,rho,"
            "Ti_eV,Te_eV,Tr_eV,zbar,P,e,cs,q,alpha\n";
     out.precision(9);
-    for (int k = 0; k < M; ++k) {
-        const auto& m = mats_[matid[k]];
-        const double Tik = twoT_ ? Ti[k] : T[k];
-        const double Tek = twoT_ ? Te[k] : T[k];
-        const double Trk = rad_ ? std::pow(Er[k] / phys::a_rad, 0.25) : 0.0;
-        const double ek = twoT_ ? ei[k] + ee[k] : e[k];
-        const double alpha = P[k] / fermiPressure0(rho[k], m.Z, m.A);
-        out << k << ',' << m.name << ','
-            << r[k] << ',' << r[k + 1] << ',' << 0.5 * (r[k] + r[k + 1]) << ','
-            << u[k] << ',' << u[k + 1] << ','
-            << rho[k] << ',' << Tik << ',' << Tek << ',' << Trk << ','
-            << zb[k] << ',' << P[k] << ',' << ek << ',' << cs[k] << ',' << q[k]
-            << ',' << alpha << '\n';
+    for (int k = 0; k < numZones_; ++k) {
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        const double ionTemp_eV =
+            twoTemperature_ ? ionTemperature_eV[k] : zoneTemperature_eV[k];
+        const double electronTemp_eV =
+            twoTemperature_ ? electronTemperature_eV[k] : zoneTemperature_eV[k];
+        // Radiation temperature Tr = (Er/a)^{1/4}, zero when radiation off.
+        const double radiationTemp_eV =
+            radiationOn_
+                ? std::pow(radiationEnergyDensity_ergcc[k] / phys::a_rad, 0.25)
+                : 0.0;
+        const double totalSpecificEnergy_ergg =
+            twoTemperature_
+                ? ionSpecificEnergy_ergg[k] + electronSpecificEnergy_ergg[k]
+                : zoneSpecificEnergy_ergg[k];
+        // Per-zone adiabat alpha = P / P_Fermi(rho): the compression metric.
+        const double adiabat = zonePressure_dyncm2[k] /
+                               fermiPressure0(zoneDensity_gcc[k], material.Z,
+                                              material.A);
+        out << k << ',' << material.name << ',' << nodeRadius_cm[k] << ','
+            << nodeRadius_cm[k + 1] << ','
+            << 0.5 * (nodeRadius_cm[k] + nodeRadius_cm[k + 1]) << ','
+            << nodeVelocity_cmps[k] << ',' << nodeVelocity_cmps[k + 1] << ','
+            << zoneDensity_gcc[k] << ',' << ionTemp_eV << ',' << electronTemp_eV
+            << ',' << radiationTemp_eV << ',' << zoneMeanIonization[k] << ','
+            << zonePressure_dyncm2[k] << ',' << totalSpecificEnergy_ergg << ','
+            << zoneSoundSpeed_cmps[k] << ',' << zoneViscousPressure_dyncm2[k] << ','
+            << adiabat << '\n';
     }
 }
 
 void Simulation::writeHistoryHeader() {
-    histPath_ = (std::filesystem::path(deck_.output.directory) / "history.csv").string();
-    std::ofstream out(histPath_);
+    historyFilePath_ =
+        (std::filesystem::path(deck_.output.directory) / "history.csv").string();
+    std::ofstream out(historyFilePath_);
     out << "step,t,dt,r_outer,u_outer,p_drive,P_laser,f_abs,rho_max,Ti_max,"
            "Te_max,Te_center,rhoR,E_int,E_kin,E_rad,W_drive,E_laser,E_floor,"
            "E_leak,E_err,P_fus,Y_n\n";
 }
 
 void Simulation::writeHistoryRow() {
-    double Eint = 0.0, Ekin = 0.0, Erad = 0.0, rhoR = 0.0, rhomax = 0.0;
-    double Timax = 0.0, Temax = 0.0;
-    for (int k = 0; k < M; ++k) {
-        Eint += dm[k] * (twoT_ ? ei[k] + ee[k] : e[k]);
-        if (rad_) Erad += Er[k] * volume(r[k], r[k + 1]);
-        rhoR += rho[k] * (r[k + 1] - r[k]);
-        rhomax = std::max(rhomax, rho[k]);
-        Timax = std::max(Timax, twoT_ ? Ti[k] : T[k]);
-        Temax = std::max(Temax, twoT_ ? Te[k] : T[k]);
+    // Global sums for the energy-conservation diagnostic and quick-look
+    // implosion metrics.
+    double internalEnergy_erg = 0.0, kineticEnergy_erg = 0.0;
+    double radiationEnergy_erg = 0.0, arealDensity_gcm2 = 0.0;
+    double maxDensity_gcc = 0.0, maxIonTemp_eV = 0.0, maxElectronTemp_eV = 0.0;
+    for (int k = 0; k < numZones_; ++k) {
+        internalEnergy_erg +=
+            zoneMass_g[k] * (twoTemperature_
+                                 ? ionSpecificEnergy_ergg[k] +
+                                       electronSpecificEnergy_ergg[k]
+                                 : zoneSpecificEnergy_ergg[k]);
+        if (radiationOn_)
+            radiationEnergy_erg +=
+                radiationEnergyDensity_ergcc[k] *
+                shellVolume(nodeRadius_cm[k], nodeRadius_cm[k + 1]);
+        arealDensity_gcm2 +=
+            zoneDensity_gcc[k] * (nodeRadius_cm[k + 1] - nodeRadius_cm[k]);
+        maxDensity_gcc = std::max(maxDensity_gcc, zoneDensity_gcc[k]);
+        maxIonTemp_eV = std::max(
+            maxIonTemp_eV, twoTemperature_ ? ionTemperature_eV[k] : zoneTemperature_eV[k]);
+        maxElectronTemp_eV =
+            std::max(maxElectronTemp_eV, twoTemperature_ ? electronTemperature_eV[k]
+                                                         : zoneTemperature_eV[k]);
     }
-    for (int i = 0; i <= M; ++i) Ekin += 0.5 * dmNode[i] * u[i] * u[i];
-    const double Etot = Eint + Ekin + Erad;
-    const double scale = std::max({std::abs(Etot), std::abs(driveWork),
-                                   std::abs(Elaser), std::abs(E0), 1e-300});
-    const double err = (Etot - E0 - driveWork - Elaser - Efloor + Eleak) / scale;
+    for (int i = 0; i <= numZones_; ++i)
+        kineticEnergy_erg +=
+            0.5 * nodeMass_g[i] * nodeVelocity_cmps[i] * nodeVelocity_cmps[i];
+    const double totalEnergy_erg =
+        internalEnergy_erg + kineticEnergy_erg + radiationEnergy_erg;
+    // Relative energy-conservation error: everything the system holds now,
+    // minus what it started with and every tracked source, plus every
+    // tracked sink. Zero for a perfect scheme; the residual measures the
+    // operator-splitting and hydro truncation error.
+    const double scale_erg =
+        std::max({std::abs(totalEnergy_erg), std::abs(driveWorkDone_erg),
+                  std::abs(laserAbsorbed_erg), std::abs(initialTotalEnergy_erg),
+                  1e-300});
+    const double energyError = (totalEnergy_erg - initialTotalEnergy_erg -
+                                driveWorkDone_erg - laserAbsorbed_erg -
+                                floorEnergyInjected_erg + radiationLeaked_erg) /
+                               scale_erg;
 
-    std::ofstream out(histPath_, std::ios::app);
+    std::ofstream out(historyFilePath_, std::ios::app);
     out.precision(9);
-    out << step << ',' << t << ',' << dt_ << ',' << r[M] << ',' << u[M] << ','
-        << deck_.drive.pressure(t) << ','
-        << (laser_ ? deck_.laser.powerAt(t) : 0.0) << ',' << fabs_ << ','
-        << rhomax << ',' << Timax << ','
-        << Temax << ',' << (twoT_ ? Te[0] : T[0]) << ',' << rhoR << ','
-        << Eint << ',' << Ekin << ',' << Erad << ',' << driveWork << ','
-        << Elaser << ',' << Efloor << ',' << Eleak << ',' << err << ','
-        << Pfus << ',' << YnDT + YnDD << '\n';
+    out << stepCount_ << ',' << time_s << ',' << timeStep_s << ','
+        << nodeRadius_cm[numZones_] << ',' << nodeVelocity_cmps[numZones_] << ','
+        << deck_.drive.pressure(time_s) << ','
+        << (laserOn_ ? deck_.laser.powerAt(time_s) : 0.0) << ','
+        << laserAbsorbedFraction_ << ',' << maxDensity_gcc << ',' << maxIonTemp_eV
+        << ',' << maxElectronTemp_eV << ','
+        << (twoTemperature_ ? electronTemperature_eV[0] : zoneTemperature_eV[0])
+        << ',' << arealDensity_gcm2 << ',' << internalEnergy_erg << ','
+        << kineticEnergy_erg << ',' << radiationEnergy_erg << ','
+        << driveWorkDone_erg << ',' << laserAbsorbed_erg << ','
+        << floorEnergyInjected_erg << ',' << radiationLeaked_erg << ','
+        << energyError << ',' << fusionPower_ergs << ','
+        << neutronYieldDT + neutronYieldDDn << '\n';
 }
 
-// Mass-weighted adiabat alpha = P / P_Fermi(rho) of the dense fuel shell
-// (fuel zones within 1/e of the peak fuel density). P_Fermi is the T=0
-// electron Fermi pressure at full ionization -- the standard ICF reference
-// (~2.2 rho^{5/3} Mbar for DT).
+// ============================================================================
+// Fuel adiabat: mass-weighted alpha = P / P_Fermi(rho) over the DENSE part
+// of the fuel (zones within 1/e of the current peak fuel density -- i.e. the
+// compressed shell, excluding blown-off or unshocked material). P_Fermi is
+// the T=0 fully-ionized electron Fermi pressure, the standard ICF reference
+// (~2.2 rho^{5/3} Mbar for DT). alpha ~ 1 is fully degenerate fuel; ICF
+// designs aim for alpha ~ 1-3 in flight.
+// ============================================================================
 double Simulation::fuelAdiabat() const {
-    double rhomax = 0.0;
-    for (int k = 0; k < M; ++k)
-        if (fuelZone_[k]) rhomax = std::max(rhomax, rho[k]);
-    if (rhomax <= 0.0) return -1.0;
-    const double thresh = rhomax / 2.718281828;
-    double msum = 0.0, asum = 0.0;
-    for (int k = 0; k < M; ++k) {
-        if (!fuelZone_[k] || rho[k] < thresh) continue;
-        const auto& m = mats_[matid[k]];
-        asum += dm[k] * P[k] / fermiPressure0(rho[k], m.Z, m.A);
-        msum += dm[k];
+    double peakFuelDensity_gcc = 0.0;
+    for (int k = 0; k < numZones_; ++k)
+        if (zoneIsFuel_[k])
+            peakFuelDensity_gcc = std::max(peakFuelDensity_gcc, zoneDensity_gcc[k]);
+    if (peakFuelDensity_gcc <= 0.0) return -1.0;
+    const double denseThreshold_gcc = peakFuelDensity_gcc / 2.718281828;
+    double massSum_g = 0.0, weightedAdiabatSum_g = 0.0;
+    for (int k = 0; k < numZones_; ++k) {
+        if (!zoneIsFuel_[k] || zoneDensity_gcc[k] < denseThreshold_gcc) continue;
+        const auto& material = materials_[zoneMaterialIndex[k]];
+        weightedAdiabatSum_g +=
+            zoneMass_g[k] * zonePressure_dyncm2[k] /
+            fermiPressure0(zoneDensity_gcc[k], material.Z, material.A);
+        massSum_g += zoneMass_g[k];
     }
-    return (msum > 0.0) ? asum / msum : -1.0;
+    return (massSum_g > 0.0) ? weightedAdiabatSum_g / massSum_g : -1.0;
 }
 
+// ============================================================================
+// Shot-report accumulation, called once per step. Everything here is
+// diagnostic-only; nothing feeds back into the physics.
+// ============================================================================
 void Simulation::updateReport() {
-    auto& R = rep_;
-    // Global extrema.
-    double Ekin = 0.0;
-    for (int i = 0; i <= M; ++i) Ekin += 0.5 * dmNode[i] * u[i] * u[i];
-    R.EkinMax = std::max(R.EkinMax, Ekin);
-    for (int k = 0; k < M; ++k) {
-        R.rhoMax = std::max(R.rhoMax, rho[k]);
-        R.TiMax = std::max(R.TiMax, twoT_ ? Ti[k] : T[k]);
-        R.TeMax = std::max(R.TeMax, twoT_ ? Te[k] : T[k]);
-    }
-    R.pDriveMax = std::max(R.pDriveMax, deck_.drive.pressure(t));
-    if (laser_) R.pLaserMax = std::max(R.pLaserMax, deck_.laser.powerAt(t));
+    auto& report = report_;
 
-    // Fuel implosion speed (mass-averaged, inward positive) and adiabat.
-    double msum = 0.0, mv = 0.0, rrf = 0.0, rrtot = 0.0;
-    for (int k = 0; k < M; ++k) {
-        const double dr = r[k + 1] - r[k];
-        rrtot += rho[k] * dr;
-        if (!fuelZone_[k]) continue;
-        msum += dm[k];
-        mv += dm[k] * 0.5 * (u[k] + u[k + 1]);
-        rrf += rho[k] * dr;
+    // ---- global extrema over the whole run ------------------------------------
+    double kineticEnergy_erg = 0.0;
+    for (int i = 0; i <= numZones_; ++i)
+        kineticEnergy_erg +=
+            0.5 * nodeMass_g[i] * nodeVelocity_cmps[i] * nodeVelocity_cmps[i];
+    report.maxKineticEnergy_erg =
+        std::max(report.maxKineticEnergy_erg, kineticEnergy_erg);
+    for (int k = 0; k < numZones_; ++k) {
+        report.maxDensity_gcc = std::max(report.maxDensity_gcc, zoneDensity_gcc[k]);
+        report.maxIonTemperature_eV =
+            std::max(report.maxIonTemperature_eV,
+                     twoTemperature_ ? ionTemperature_eV[k] : zoneTemperature_eV[k]);
+        report.maxElectronTemperature_eV =
+            std::max(report.maxElectronTemperature_eV,
+                     twoTemperature_ ? electronTemperature_eV[k]
+                                     : zoneTemperature_eV[k]);
     }
-    const double vin = (msum > 0.0) ? -mv / msum : 0.0;
-    if (vin > R.vImp) {
-        R.vImp = vin;
-        R.tVImp = t;
-        R.adiabat = fuelAdiabat();
-    }
+    report.peakDrivePressure_dyncm2 =
+        std::max(report.peakDrivePressure_dyncm2, deck_.drive.pressure(time_s));
+    if (laserOn_)
+        report.peakLaserPower_ergs =
+            std::max(report.peakLaserPower_ergs, deck_.laser.powerAt(time_s));
 
-    // Peak fuel compression ("bang" proxy without burn) and hot-spot state.
-    if (rrf > R.rhoRFuel) {
-        R.rhoRFuel = rrf;
-        R.rhoRTotAtBang = rrtot;
-        R.tBang = t;
-        R.hsR = r[hsNode_];
-        double mh = 0.0, ti = 0.0, te = 0.0, ph = 0.0, rr = 0.0;
-        for (int k = 0; k < hsNode_ && k < M; ++k) {
-            mh += dm[k];
-            ti += dm[k] * (twoT_ ? Ti[k] : T[k]);
-            te += dm[k] * (twoT_ ? Te[k] : T[k]);
-            ph += dm[k] * P[k];
-            rr += rho[k] * (r[k + 1] - r[k]);
-        }
-        if (mh > 0.0) {
-            R.hsTi = ti / mh;
-            R.hsTe = te / mh;
-            R.hsP = ph / mh;
-            R.hsRhoR = rr;
-        }
+    // ---- fuel implosion speed (mass-averaged, inward positive) ----------------
+    // Also accumulates the areal densities used just below.
+    double fuelMass_g = 0.0, fuelMomentum_gcmps = 0.0;
+    double fuelRhoR_gcm2 = 0.0, totalRhoR_gcm2 = 0.0;
+    for (int k = 0; k < numZones_; ++k) {
+        const double zoneWidth_cm = nodeRadius_cm[k + 1] - nodeRadius_cm[k];
+        totalRhoR_gcm2 += zoneDensity_gcc[k] * zoneWidth_cm;
+        if (!zoneIsFuel_[k]) continue;
+        fuelMass_g += zoneMass_g[k];
+        fuelMomentum_gcmps += zoneMass_g[k] * 0.5 *
+                              (nodeVelocity_cmps[k] + nodeVelocity_cmps[k + 1]);
+        fuelRhoR_gcm2 += zoneDensity_gcc[k] * zoneWidth_cm;
+    }
+    const double inwardSpeed_cmps =
+        (fuelMass_g > 0.0) ? -fuelMomentum_gcmps / fuelMass_g : 0.0;
+    if (inwardSpeed_cmps > report.peakImplosionSpeed_cmps) {
+        report.peakImplosionSpeed_cmps = inwardSpeed_cmps;
+        report.peakImplosionTime_s = time_s;
+        // The design-relevant adiabat is the one the shell carries in
+        // flight, so record it at the moment of peak velocity.
+        report.fuelAdiabatAtPeakSpeed = fuelAdiabat();
     }
 
-    // Convergence and in-flight aspect ratio at 2/3 of the initial radius.
-    R.rIfMin = std::min(R.rIfMin, r[hsNode_]);
-    if (R.ifar < 0.0 && rIf0_ > 0.0 && r[hsNode_] < (2.0 / 3.0) * rIf0_) {
-        double rhomax = 0.0;
-        for (int k = 0; k < M; ++k)
-            if (fuelZone_[k]) rhomax = std::max(rhomax, rho[k]);
-        const double thresh = rhomax / 2.718281828;
-        double Rsh = 0.0, dRsh = 0.0;
-        for (int k = 0; k < M; ++k) {
-            if (!fuelZone_[k] || rho[k] < thresh) continue;
-            Rsh = std::max(Rsh, r[k + 1]);
-            dRsh += r[k + 1] - r[k];
+    // ---- peak fuel compression ("bang" proxy) and hot-spot state ---------------
+    if (fuelRhoR_gcm2 > report.peakFuelRhoR_gcm2) {
+        report.peakFuelRhoR_gcm2 = fuelRhoR_gcm2;
+        report.totalRhoRAtBang_gcm2 = totalRhoR_gcm2;
+        report.bangTime_s = time_s;
+        report.hotSpotRadius_cm = nodeRadius_cm[hotSpotNode_];
+        // Hot spot = all zones of the innermost layer (inside hotSpotNode_).
+        double hotSpotMass_g = 0.0, weightedTi_geV = 0.0, weightedTe_geV = 0.0;
+        double weightedP_gdyncm2 = 0.0, hotSpotRhoR_gcm2 = 0.0;
+        for (int k = 0; k < hotSpotNode_ && k < numZones_; ++k) {
+            hotSpotMass_g += zoneMass_g[k];
+            weightedTi_geV +=
+                zoneMass_g[k] *
+                (twoTemperature_ ? ionTemperature_eV[k] : zoneTemperature_eV[k]);
+            weightedTe_geV +=
+                zoneMass_g[k] * (twoTemperature_ ? electronTemperature_eV[k]
+                                                 : zoneTemperature_eV[k]);
+            weightedP_gdyncm2 += zoneMass_g[k] * zonePressure_dyncm2[k];
+            hotSpotRhoR_gcm2 +=
+                zoneDensity_gcc[k] * (nodeRadius_cm[k + 1] - nodeRadius_cm[k]);
         }
-        if (dRsh > 0.0) {
-            R.ifar = Rsh / dRsh;
-            R.tIfar = t;
+        if (hotSpotMass_g > 0.0) {
+            report.hotSpotTi_eV = weightedTi_geV / hotSpotMass_g;
+            report.hotSpotTe_eV = weightedTe_geV / hotSpotMass_g;
+            report.hotSpotPressure_dyncm2 = weightedP_gdyncm2 / hotSpotMass_g;
+            report.hotSpotRhoR_gcm2 = hotSpotRhoR_gcm2;
+        }
+    }
+
+    // ---- convergence ratio and in-flight aspect ratio ---------------------------
+    report.minHotSpotRadius_cm =
+        std::min(report.minHotSpotRadius_cm, nodeRadius_cm[hotSpotNode_]);
+    // IFAR is measured once, the first time the hot-spot boundary passes 2/3
+    // of its initial radius (the conventional in-flight sampling point).
+    if (report.inFlightAspectRatio < 0.0 && hotSpotRadius0_cm > 0.0 &&
+        nodeRadius_cm[hotSpotNode_] < (2.0 / 3.0) * hotSpotRadius0_cm) {
+        double peakFuelDensity_gcc = 0.0;
+        for (int k = 0; k < numZones_; ++k)
+            if (zoneIsFuel_[k])
+                peakFuelDensity_gcc =
+                    std::max(peakFuelDensity_gcc, zoneDensity_gcc[k]);
+        const double denseThreshold_gcc = peakFuelDensity_gcc / 2.718281828;
+        // Shell = dense fuel (within 1/e of the peak); IFAR = its outer
+        // radius over its total thickness.
+        double shellOuterRadius_cm = 0.0, shellThickness_cm = 0.0;
+        for (int k = 0; k < numZones_; ++k) {
+            if (!zoneIsFuel_[k] || zoneDensity_gcc[k] < denseThreshold_gcc) continue;
+            shellOuterRadius_cm = std::max(shellOuterRadius_cm, nodeRadius_cm[k + 1]);
+            shellThickness_cm += nodeRadius_cm[k + 1] - nodeRadius_cm[k];
+        }
+        if (shellThickness_cm > 0.0) {
+            report.inFlightAspectRatio = shellOuterRadius_cm / shellThickness_cm;
+            report.ifarTime_s = time_s;
         }
     }
 }
 
 void Simulation::writeReport() const {
-    const auto& R = rep_;
-    std::string txt;
+    const auto& report = report_;
+    std::string text;
     char line[256];
-    auto add = [&](const char* fmt, auto... args) {
+    auto add = [&](const char* format, auto... args) {
         if constexpr (sizeof...(args) == 0) {
-            txt += fmt;
+            text += format;
         } else {
-            std::snprintf(line, sizeof(line), fmt, args...);
-            txt += line;
+            std::snprintf(line, sizeof(line), format, args...);
+            text += line;
         }
-        txt += '\n';
+        text += '\n';
     };
 
     add("=============== hydro1d shot report ===============");
     add("run: %d zones, %s, conduction %s, radiation %s, laser %s",
-        M, twoT_ ? "2T" : "1T", deck_.conduction.enabled ? "on" : "off",
-        rad_ ? "on" : "off", laser_ ? "on" : "off");
-    add("end: t = %.4g s in %ld steps", t, step);
+        numZones_, twoTemperature_ ? "2T" : "1T",
+        deck_.conduction.enabled ? "on" : "off", radiationOn_ ? "on" : "off",
+        laserOn_ ? "on" : "off");
+    add("end: t = %.4g s in %ld steps", time_s, stepCount_);
     if (noFuelFlag_)
         add("NOTE: no material has 'fuel = true'; fuel metrics use all zones");
 
-    if (laser_) {
+    if (laserOn_) {
         add("laser: E_inc = %.4g erg (%.1f kJ), absorbed = %.4g erg (%.1f kJ), "
             "coupling = %.1f%%, peak power = %.3g erg/s",
-            ElaserInc, ElaserInc / 1e10, Elaser, Elaser / 1e10,
-            (ElaserInc > 0.0) ? 100.0 * Elaser / ElaserInc : 0.0, R.pLaserMax);
+            laserIncident_erg, laserIncident_erg / 1e10, laserAbsorbed_erg,
+            laserAbsorbed_erg / 1e10,
+            (laserIncident_erg > 0.0) ? 100.0 * laserAbsorbed_erg / laserIncident_erg
+                                      : 0.0,
+            report.peakLaserPower_ergs);
     }
-    if (R.pDriveMax > 0.0)
+    if (report.peakDrivePressure_dyncm2 > 0.0)
         add("drive: peak pressure = %.3g dyn/cm^2 (%.1f Mbar), work = %.4g erg",
-            R.pDriveMax, R.pDriveMax / 1e12, driveWork);
+            report.peakDrivePressure_dyncm2, report.peakDrivePressure_dyncm2 / 1e12,
+            driveWorkDone_erg);
 
     if (deck_.control.geometry == 3) {
         add("implosion:");
         add("  peak implosion speed  = %.1f km/s at %.4g s (fuel mass-avg)",
-            R.vImp / 1e5, R.tVImp);
-        if (R.adiabat > 0.0)
+            report.peakImplosionSpeed_cmps / 1e5, report.peakImplosionTime_s);
+        if (report.fuelAdiabatAtPeakSpeed > 0.0)
             add("  fuel adiabat then     = %.2f (mass-avg P/P_Fermi, dense shell)",
-                R.adiabat);
-        if (R.ifar > 0.0)
-            add("  IFAR (at 2/3 R0)      = %.1f at %.4g s", R.ifar, R.tIfar);
+                report.fuelAdiabatAtPeakSpeed);
+        if (report.inFlightAspectRatio > 0.0)
+            add("  IFAR (at 2/3 R0)      = %.1f at %.4g s",
+                report.inFlightAspectRatio, report.ifarTime_s);
         add("  convergence ratio     = %.1f (hot-spot boundary %.4g -> %.4g cm)",
-            (R.rIfMin > 0.0) ? rIf0_ / R.rIfMin : -1.0, rIf0_, R.rIfMin);
-        add("  bang time (peak fuel rhoR) = %.4g s", R.tBang);
+            (report.minHotSpotRadius_cm > 0.0)
+                ? hotSpotRadius0_cm / report.minHotSpotRadius_cm
+                : -1.0,
+            hotSpotRadius0_cm, report.minHotSpotRadius_cm);
+        add("  bang time (peak fuel rhoR) = %.4g s", report.bangTime_s);
         add("  peak fuel rhoR        = %.3g g/cm^2 (total rhoR then: %.3g)",
-            R.rhoRFuel, R.rhoRTotAtBang);
+            report.peakFuelRhoR_gcm2, report.totalRhoRAtBang_gcm2);
         add("  hot spot at bang: R = %.1f um, <Ti> = %.3g eV, <Te> = %.3g eV",
-            R.hsR * 1e4, R.hsTi, R.hsTe);
+            report.hotSpotRadius_cm * 1e4, report.hotSpotTi_eV, report.hotSpotTe_eV);
         add("                    <P> = %.3g dyn/cm^2 (%.2f Gbar), rhoR = %.3g g/cm^2",
-            R.hsP, R.hsP / 1e15, R.hsRhoR);
+            report.hotSpotPressure_dyncm2, report.hotSpotPressure_dyncm2 / 1e15,
+            report.hotSpotRhoR_gcm2);
     }
-    if (burn_) {
+    if (burnOn_) {
         add("burn (diagnostic only, no self-heating):");
-        add("  DT neutron yield      = %.4g  (DD-n yield: %.3g)", YnDT, YnDD);
-        add("  fusion energy         = %.4g erg (%.3g kJ)", Efus, Efus / 1e10);
-        const double Ein = laser_ ? ElaserInc : driveWork;
-        if (Ein > 0.0)
+        add("  DT neutron yield      = %.4g  (DD-n yield: %.3g)", neutronYieldDT,
+            neutronYieldDDn);
+        add("  fusion energy         = %.4g erg (%.3g kJ)", fusionEnergy_erg,
+            fusionEnergy_erg / 1e10);
+        const double inputEnergy_erg = laserOn_ ? laserIncident_erg : driveWorkDone_erg;
+        if (inputEnergy_erg > 0.0)
             add("  target gain           = %.3g (vs %s energy)",
-                Efus / Ein, laser_ ? "incident laser" : "drive work");
+                fusionEnergy_erg / inputEnergy_erg,
+                laserOn_ ? "incident laser" : "drive work");
         add("  bang time (peak fusion power) = %.4g s, peak P_fus = %.4g erg/s",
-            tBangBurn, PfusMax);
-        if (PfusMax > 0.0)
-            add("  burn width (E_fus/P_fus,peak) = %.3g s", Efus / PfusMax);
-        if (burnWSum > 0.0)
-            add("  burn-averaged Ti      = %.3g keV", burnTiSum / burnWSum);
+            fusionBangTime_s, peakFusionPower_ergs);
+        if (peakFusionPower_ergs > 0.0)
+            add("  burn width (E_fus/P_fus,peak) = %.3g s",
+                fusionEnergy_erg / peakFusionPower_ergs);
+        if (burnWeightSum > 0.0)
+            add("  burn-averaged Ti      = %.3g keV",
+                burnWeightedTiSum_keV / burnWeightSum);
     }
     add("extrema: rho_max = %.4g g/cc, Ti_max = %.4g eV, Te_max = %.4g eV, "
-        "E_kin_max = %.4g erg", R.rhoMax, R.TiMax, R.TeMax, R.EkinMax);
+        "E_kin_max = %.4g erg",
+        report.maxDensity_gcc, report.maxIonTemperature_eV,
+        report.maxElectronTemperature_eV, report.maxKineticEnergy_erg);
     add("energy bookkeeping: floors injected %.3g erg, radiation leaked %.3g erg",
-        Efloor, Eleak);
+        floorEnergyInjected_erg, radiationLeaked_erg);
     add("===================================================");
 
-    std::cout << txt;
+    std::cout << text;
     std::ofstream out(std::filesystem::path(deck_.output.directory) / "report.txt");
-    out << txt;
+    out << text;
 }
 
+// ============================================================================
+// Main time loop. Each pass advances one time step through every enabled
+// physics stage (see the class comment for why this order), then handles
+// output. Only the hydro is explicit; everything else is implicit, so
+// computeTimeStep() need only satisfy the acoustic CFL condition.
+// ============================================================================
 void Simulation::run() {
     std::filesystem::create_directories(deck_.output.directory);
     writeHistoryHeader();
     writeHistoryRow();
-    int snapIndex = 0;
-    writeSnapshot(snapIndex++);
-    double nextDump = (deck_.output.dt_dump > 0.0) ? deck_.output.dt_dump
-                                                   : 2.0 * deck_.control.t_end;
+    int snapshotIndex = 0;
+    writeSnapshot(snapshotIndex++);
+    double nextDumpTime_s = (deck_.output.dt_dump > 0.0)
+                                ? deck_.output.dt_dump
+                                : 2.0 * deck_.control.t_end;  // i.e. never
 
-    std::cout << "hydro1d: " << M << " zones, geometry d=" << deck_.control.geometry
-              << ", " << (twoT_ ? "2T" : "1T")
+    std::cout << "hydro1d: " << numZones_ << " zones, geometry d="
+              << deck_.control.geometry << ", " << (twoTemperature_ ? "2T" : "1T")
               << ", conduction " << (deck_.conduction.enabled ? "on" : "off")
-              << ", radiation " << (rad_ ? "on" : "off")
-              << ", laser " << (laser_ ? "on" : "off")
-              << ", outer BC " << deck_.control.bc_outer << "\n";
+              << ", radiation " << (radiationOn_ ? "on" : "off") << ", laser "
+              << (laserOn_ ? "on" : "off") << ", outer BC "
+              << deck_.control.bc_outer << "\n";
 
-    const bool refresh = deck_.conduction.enabled || twoT_ || rad_ || laser_;
-    dt_ = deck_.control.dt_init;
-    while (t < deck_.control.t_end && step < deck_.control.max_steps) {
-        dt_ = std::min(computeDt(), deck_.control.t_end - t);
-        if (step == 0) dt_ = std::min(dt_, deck_.control.dt_init);
+    // Stages beyond the hydro leave (P, cs, Zbar) stale after they move
+    // energy around; refresh once per step when any of them is active.
+    const bool needsEndOfStepRefresh =
+        deck_.conduction.enabled || twoTemperature_ || radiationOn_ || laserOn_;
+    timeStep_s = deck_.control.dt_init;
+    while (time_s < deck_.control.t_end && stepCount_ < deck_.control.max_steps) {
+        timeStep_s = std::min(computeTimeStep(), deck_.control.t_end - time_s);
+        if (stepCount_ == 0) timeStep_s = std::min(timeStep_s, deck_.control.dt_init);
 
-        hydroStep(dt_);
-        laserStep(dt_);
-        couplingStep(dt_);
-        conductionStep(dt_);
-        radiationStep(dt_);
-        burnStep(dt_);
-        if (refresh) {
-            updateEosDerived();
-            applyFloors();
+        hydroStep(timeStep_s);
+        laserStep(timeStep_s);
+        couplingStep(timeStep_s);
+        conductionStep(timeStep_s);
+        radiationStep(timeStep_s);
+        burnStep(timeStep_s);
+        if (needsEndOfStepRefresh) {
+            updateThermodynamics();
+            applyTemperatureFloors();
         }
 
-        t += dt_;
-        ++step;
+        time_s += timeStep_s;
+        ++stepCount_;
 
         updateReport();
-        if (step % deck_.output.history_stride == 0) writeHistoryRow();
-        if (t >= nextDump - 1e-30) {
-            writeSnapshot(snapIndex++);
-            nextDump += deck_.output.dt_dump;
+        if (stepCount_ % deck_.output.history_stride == 0) writeHistoryRow();
+        if (time_s >= nextDumpTime_s - 1e-30) {
+            writeSnapshot(snapshotIndex++);
+            nextDumpTime_s += deck_.output.dt_dump;
         }
-        if (step % 20000 == 0)
-            std::cout << "  step " << step << "  t = " << t << " s  dt = " << dt_
-                      << " s\n";
+        if (stepCount_ % 20000 == 0)
+            std::cout << "  step " << stepCount_ << "  t = " << time_s
+                      << " s  dt = " << timeStep_s << " s\n";
     }
 
     writeHistoryRow();
-    writeSnapshot(snapIndex);
+    writeSnapshot(snapshotIndex);
     writeReport();
-    std::cout << "hydro1d: done. t = " << t << " s in " << step << " steps. Output in "
-              << deck_.output.directory << "/\n";
+    std::cout << "hydro1d: done. t = " << time_s << " s in " << stepCount_
+              << " steps. Output in " << deck_.output.directory << "/\n";
 }

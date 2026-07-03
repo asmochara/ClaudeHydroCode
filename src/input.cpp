@@ -1,3 +1,16 @@
+// ============================================================================
+// input.cpp -- the input-deck parser. The deck format is plain text:
+//   [section]           section header ([material NAME] carries a name,
+//                       each [layer] appends a new layer, innermost first)
+//   key = value         within the current section
+//   # ...               comments, allowed anywhere on a line
+// Parsing is two-phase: read everything into the InputDeck structs, then
+// validate cross-cutting requirements (materials referenced by layers exist,
+// physics options have the data they need, ...) with error messages that
+// name the file, line, or offending material. See input.hpp for every key
+// and its units.
+// ============================================================================
+
 #include "input.hpp"
 
 #include <algorithm>
@@ -224,7 +237,10 @@ InputDeck parseDeck(const std::string& path) {
         }
     }
 
-    // --- validation -----------------------------------------------------
+    // --- validation ----------------------------------------------------------
+    // Everything below cross-checks the assembled deck so that bad input
+    // fails here, with a specific message, rather than deep inside a physics
+    // stage with a cryptic one.
     if (deck.control.t_end <= 0.0) throw std::runtime_error("input: control.t_end must be > 0");
     if (deck.layers.empty()) throw std::runtime_error("input: at least one [layer] is required");
     for (size_t i = 0; i < deck.layers.size(); ++i) {
