@@ -1,5 +1,6 @@
 #pragma once
 
+#include "constants.hpp"
 #include "eos.hpp"
 #include "input.hpp"
 
@@ -8,6 +9,22 @@
 
 // ============================================================================
 // Simulation: the 1D Lagrangian hydrodynamics engine and all attached physics.
+//
+// SOURCE LAYOUT: the class is implemented across per-physics translation
+// units so each piece can be read and debugged in isolation:
+//   simulation.cpp - constructor (material instantiation), time-step control,
+//                    the Coulomb logarithm, and the main run() loop
+//   mesh.cpp       - mesh/IC setup, thermodynamic refresh, temperature floors
+//   hydro.cpp      - the Lagrangian hydro step (momentum, motion, artificial
+//                    viscosity, PdV energy update)
+//   laser.cpp      - focal-spot ray set, the refracting ray trace with
+//                    inverse-bremsstrahlung absorption and Langdon effect
+//   coupling.cpp   - electron-ion temperature relaxation (2T)
+//   conduction.cpp - Spitzer-Harm/Braginskii conductivities and the
+//                    flux-limited implicit conduction solve
+//   radiation.cpp  - grey flux-limited radiation diffusion + matter coupling
+//   burn.cpp       - burn-off fusion diagnostics
+//   output.cpp     - snapshots, history file, shot report
 //
 // MESH LAYOUT (staggered, von Neumann-Richtmyer):
 //   The mesh has numZones_ zones and numZones_+1 nodes. Kinematic quantities
@@ -58,9 +75,28 @@ private:
     // ---- geometry helpers --------------------------------------------------
     // The geometry index d = 1 (planar), 2 (cylindrical), 3 (spherical) sets
     // the area and volume elements. In planar geometry quantities are per
-    // unit area; in cylindrical, per unit length.
-    double faceArea(double radius_cm) const;                       // [cm^2]
-    double shellVolume(double innerRadius_cm, double outerRadius_cm) const;  // [cm^3]
+    // unit area; in cylindrical, per unit length. Defined inline in the
+    // header because they sit inside per-zone loops in every physics file.
+    double faceArea(double radius_cm) const {                       // [cm^2]
+        switch (deck_.control.geometry) {
+            case 1: return 1.0;
+            case 2: return 2.0 * phys::pi * radius_cm;
+            default: return 4.0 * phys::pi * radius_cm * radius_cm;
+        }
+    }
+    double shellVolume(double innerRadius_cm, double outerRadius_cm) const {  // [cm^3]
+        switch (deck_.control.geometry) {
+            case 1:
+                return outerRadius_cm - innerRadius_cm;
+            case 2:
+                return phys::pi * (outerRadius_cm * outerRadius_cm -
+                                   innerRadius_cm * innerRadius_cm);
+            default:
+                return 4.0 / 3.0 * phys::pi *
+                       (outerRadius_cm * outerRadius_cm * outerRadius_cm -
+                        innerRadius_cm * innerRadius_cm * innerRadius_cm);
+        }
+    }
 
     // ---- setup -------------------------------------------------------------
     void setupMesh();          // build zones from the layer specs, set ICs

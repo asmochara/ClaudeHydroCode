@@ -10,6 +10,8 @@ endif()
 
 option(HYDRO1D_USE_OPENMP "Enable OpenMP threading" ON)
 
+# The Simulation class is split across per-physics translation units; see
+# the source-layout map at the top of src/simulation.hpp.
 add_executable(hydro1d
   src/main.cpp
   src/input.cpp
@@ -19,6 +21,14 @@ add_executable(hydro1d
   src/zbar.cpp
   src/opacity.cpp
   src/simulation.cpp
+  src/mesh.cpp
+  src/hydro.cpp
+  src/laser.cpp
+  src/coupling.cpp
+  src/conduction.cpp
+  src/radiation.cpp
+  src/burn.cpp
+  src/output.cpp
 )
 
 # Warning flags per compiler family (MSVC does not understand -Wall/-Wextra).
